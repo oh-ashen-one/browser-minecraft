@@ -1,69 +1,88 @@
 {
   "project": "cubeland",
   "branchName": "ralph/engine",
-  "description": "Playable browser Minecraft-like named CUBELAND. Vite + TypeScript.",
+  "description": "Playable browser Minecraft-like named CUBELAND. Vite + TypeScript. YouTube-quality game slice, not a rotating cube.",
   "userStories": [
     {
       "id": "US-001",
       "title": "Vite app with main.ts actually imported",
-      "description": "index.html must include <script type=\"module\" src=\"/src/main.ts\">. main.ts must exist and set window.__CUBELAND_READY__ = true after boot.",
+      "description": "Scaffold Vite + TS. index.html MUST include <script type=\"module\" src=\"/src/main.ts\">. main.ts exists, mounts a canvas, and sets window.__CUBELAND_READY__ = true after boot. Title CUBELAND on a game-like loading frame. No unused player.ts sitting beside an empty main.",
       "acceptanceCriteria": [
         "src/main.ts exists",
         "index.html imports /src/main.ts",
+        "main.ts sets window.__CUBELAND_READY__",
         "npm install && npx tsc --noEmit exits 0"
       ],
       "priority": 1,
       "passes": false,
-      "verify": "test -f src/main.ts && grep -q '/src/main.ts' index.html && npm install && npx tsc --noEmit"
+      "verify": "test -f src/main.ts && grep -q '/src/main.ts' index.html && grep -q '__CUBELAND_READY__' src/main.ts && npm install && npx tsc --noEmit"
     },
     {
       "id": "US-002",
       "title": "World + player render loop",
-      "description": "WebGL or canvas voxel view. Player can look and WASD. Hide boot canvas when ready.",
+      "description": "First-person voxel view (WebGL or well-drawn canvas). Player look (pointer lock) and WASD + space jump + gravity. World and Player constructed from main.ts. Hide boot canvas when ready. Chunky block colors, a horizon, a readable crosshair. Not a single spinning cube.",
       "acceptanceCriteria": [
-        "World and Player are constructed from main.ts",
+        "World and Player constructed from main.ts",
         "Game loop runs",
+        "Pointer lock or mouse-look exists",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 2,
       "passes": false,
-      "verify": "npx tsc --noEmit && grep -q '__CUBELAND_READY__' src/main.ts"
+      "verify": "npx tsc --noEmit && grep -q '__CUBELAND_READY__' src/main.ts && grep -R -q -E 'pointerlock|requestPointerLock|mousemove' src && grep -R -q -E 'WASD|KeyW|movement' src"
     },
     {
       "id": "US-003",
       "title": "Break and place blocks",
-      "description": "Hold break, right-click place, hotbar 1-9.",
+      "description": "Hold to break the targeted block. Right-click places the selected hotbar block. Hotbar keys 1-9. Visible hotbar UI with selected slot. Breaking takes time and shows a crack or progress.",
       "acceptanceCriteria": [
         "Break/place in player or main",
+        "Hotbar 1-9 exists",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 3,
       "passes": false,
-      "verify": "npx tsc --noEmit"
+      "verify": "npx tsc --noEmit && grep -R -q -E 'break|mine|destroy' src && grep -R -q -E 'place|setBlock' src && grep -R -q -E 'hotbar|Digit1' src"
     },
     {
       "id": "US-004",
       "title": "Inventory + crafting table recipes",
-      "description": "E inventory, planks/sticks/table/tools/torch.",
+      "description": "E toggles inventory. Crafting table recipes for planks, sticks, table, pickaxe/axe/shovel, torch. Inventory is a real grid, not an alert().",
       "acceptanceCriteria": [
         "InvModel used from the game loop",
+        "Crafting recipes exist",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 4,
       "passes": false,
-      "verify": "npx tsc --noEmit"
+      "verify": "npx tsc --noEmit && grep -R -q -E 'inventory|InvModel' src && grep -R -q -E 'plank|stick|torch' src && grep -R -q -E 'KeyE|inventoryOpen' src"
     },
     {
       "id": "US-005",
       "title": "Day/night + one hostile",
-      "description": "Accelerated clock, one night mob.",
+      "description": "Accelerated clock. Sky and lighting change. One night mob that walks toward the player. HUD shows time of day.",
       "acceptanceCriteria": [
         "Day/night exists",
+        "One hostile exists",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 5,
       "passes": false,
-      "verify": "npx tsc --noEmit"
+      "verify": "npx tsc --noEmit && grep -R -q -E 'day|night|skyTime|timeOfDay' src && grep -R -q -E 'hostile|mob|zombie|creeper' src"
+    },
+    {
+      "id": "US-006",
+      "title": "YouTube playable polish",
+      "description": "Title screen CUBELAND, pause on Escape, health or hunger bar, block-break particles or punch swing, enough world to walk for 20 seconds without falling through. Looks like a game trailer slice.",
+      "acceptanceCriteria": [
+        "Title or pause UI exists",
+        "HUD has more than a hotbar",
+        "npx tsc --noEmit exits 0",
+        "At least 5 source files under src/"
+      ],
+      "priority": 6,
+      "passes": false,
+      "verify": "npx tsc --noEmit && test $(find src -name '*.ts' | wc -l) -ge 5 && grep -R -q -E 'pause|Escape|title|CUBELAND' src index.html && grep -q '__CUBELAND_READY__' src/main.ts"
     }
   ]
 }
