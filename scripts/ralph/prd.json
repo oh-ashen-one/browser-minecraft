@@ -1,0 +1,69 @@
+{
+  "project": "cubeland",
+  "branchName": "ralph/engine",
+  "description": "Playable browser Minecraft-like named CUBELAND. Vite + TypeScript.",
+  "userStories": [
+    {
+      "id": "US-001",
+      "title": "Vite app with main.ts actually imported",
+      "description": "index.html must include <script type=\"module\" src=\"/src/main.ts\">. main.ts must exist and set window.__CUBELAND_READY__ = true after boot.",
+      "acceptanceCriteria": [
+        "src/main.ts exists",
+        "index.html imports /src/main.ts",
+        "npm install && npx tsc --noEmit exits 0"
+      ],
+      "priority": 1,
+      "passes": false,
+      "verify": "test -f src/main.ts && grep -q '/src/main.ts' index.html && npm install && npx tsc --noEmit"
+    },
+    {
+      "id": "US-002",
+      "title": "World + player render loop",
+      "description": "WebGL or canvas voxel view. Player can look and WASD. Hide boot canvas when ready.",
+      "acceptanceCriteria": [
+        "World and Player are constructed from main.ts",
+        "Game loop runs",
+        "npx tsc --noEmit exits 0"
+      ],
+      "priority": 2,
+      "passes": false,
+      "verify": "npx tsc --noEmit && grep -q '__CUBELAND_READY__' src/main.ts"
+    },
+    {
+      "id": "US-003",
+      "title": "Break and place blocks",
+      "description": "Hold break, right-click place, hotbar 1-9.",
+      "acceptanceCriteria": [
+        "Break/place in player or main",
+        "npx tsc --noEmit exits 0"
+      ],
+      "priority": 3,
+      "passes": false,
+      "verify": "npx tsc --noEmit"
+    },
+    {
+      "id": "US-004",
+      "title": "Inventory + crafting table recipes",
+      "description": "E inventory, planks/sticks/table/tools/torch.",
+      "acceptanceCriteria": [
+        "InvModel used from the game loop",
+        "npx tsc --noEmit exits 0"
+      ],
+      "priority": 4,
+      "passes": false,
+      "verify": "npx tsc --noEmit"
+    },
+    {
+      "id": "US-005",
+      "title": "Day/night + one hostile",
+      "description": "Accelerated clock, one night mob.",
+      "acceptanceCriteria": [
+        "Day/night exists",
+        "npx tsc --noEmit exits 0"
+      ],
+      "priority": 5,
+      "passes": false,
+      "verify": "npx tsc --noEmit"
+    }
+  ]
+}
