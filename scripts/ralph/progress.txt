@@ -139,3 +139,87 @@ Started: Sat Aug 15 18:32:35 EDT 2026
 - files: (none)
 - no files emitted
 ---
+
+## 2026-08-16 08:32 UTC - US-003
+- verify_ok: True
+- files: src/hud.ts
+- checks passed
+---
+
+## 2026-08-16 08:34 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:35 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:36 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:37 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:37 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:38 UTC - US-004
+- verify_ok: False
+- files: (none)
+- no files emitted
+---
+
+## 2026-08-16 08:46 UTC - US-004
+- verify_ok: False
+- files: src/main.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 09:01 UTC - US-004
+- verify_ok: False
+- files: src/inventory.ts, src/hud.ts, src/main.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 09:18 UTC - US-004
+- verify_ok: False
+- files: src/hud.ts, src/main.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 09:34 UTC - US-004
+- verify_ok: False
+- files: src/hud.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 09:38 UTC - US-004
+- verify_ok: False
+- files: src/hud.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 09:44 UTC - US-004
+- verify_ok: False
+- files: src/hud.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 10:07 UTC - US-004
+- verify_ok: False
+- files: src/inv.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---

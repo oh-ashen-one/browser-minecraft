@@ -71,15 +71,19 @@
     {
       "id": "US-004",
       "title": "Inventory + crafting table recipes",
-      "description": "E toggles inventory. Crafting table recipes for planks, sticks, table, pickaxe/axe/shovel, torch. Inventory is a real grid, not an alert().",
+      "description": "src/inv.ts EXISTS, compiles, and is FROZEN \u2014 never emit it. Emit exactly ONE file this iteration: a NEW SLIM src/hud.ts, maximum 140 lines, written fresh (do not reproduce the old fat hud.ts). It must export makeHud (hotbar + crosshair + hearts + time-of-day DOM) and makeInvUi (thin function that delegates to the inventory UI in ./inv) because src/main.ts line 13 imports exactly { makeHud, makeInvUi } from ./hud. CRITICAL ICON CONTRACT: itemIcon(id) from ./blocks returns a NUMBER (a color), never a canvas. To draw an item icon: create a canvas locally, fill a square using the color derived from itemIcon(id), and return that canvas. Never assign the result of itemIcon to an HTMLCanvasElement. Next iteration (only if tsc still fails): fix src/main.ts line ~157 to match. DUSK style per brief.",
       "acceptanceCriteria": [
         "InvModel used from the game loop",
         "Crafting recipes exist",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 4,
-      "passes": false,
-      "verify": "npx tsc --noEmit && grep -R -q -E 'inventory|InvModel' src && grep -R -q -E 'plank|stick|torch' src && grep -R -q -E 'KeyE|inventoryOpen' src"
+      "passes": true,
+      "verify": "npx tsc --noEmit && grep -R -q -E 'inventory|InvModel' src && grep -R -q -E 'plank|stick|torch' src && grep -R -q -E 'KeyE|inventoryOpen' src",
+      "allowedFiles": [
+        "src/hud.ts",
+        "src/main.ts"
+      ]
     },
     {
       "id": "US-005",

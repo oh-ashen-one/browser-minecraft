@@ -1,15 +1,16 @@
 /**
  * CUBELAND — engine bootstrap.
- * Boots the WebGL render loop: a golden-hour desert sky, the chunked voxel
- * world (mesa strata + cacti), and a first-person Player with pointer-lock
- * mouse-look, WASD movement, Space jump and gravity. Sets
- * window.__CUBELAND_READY__ once the first frame is live so index.html can
- * hide its boot canvas.
+ * Boots the WebGL render loop: golden-hour desert sky, chunked voxel world
+ * (mesa strata + cacti), first-person Player with pointer-lock mouse-look,
+ * WASD + Space jump + gravity. E toggles a real inventory grid with shape
+ * crafting (InvModel, driven from the loop). Sets window.__CUBELAND_READY__
+ * once the first frame is live so index.html hides its boot canvas.
  */
-
 import { World } from './world';
 import { Player } from './player';
-import { mulberry32 } from './noise';
+import { itemIcon, itemName } from './blocks';
+import { InvModel } from './inventory';
+import { makeHud, makeInvUi } from './hud';
 
 declare global {
   interface Window { __CUBELAND_READY__?: boolean; }
@@ -33,8 +34,7 @@ function mul(a: Float32Array, b: Float32Array): Float32Array {
 }
 
 function translate(x: number, y: number, z: number): Float32Array {
-  const m = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
-  return m;
+  return new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
 }
 
 function rotX(a: number): Float32Array {
@@ -60,9 +60,7 @@ function compile(gl: WebGLRenderingContext, type: number, src: string): WebGLSha
   const sh = gl.createShader(type)!;
   gl.shaderSource(sh, src);
   gl.compileShader(sh);
-  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
-    throw new Error('shader: ' + (gl.getShaderInfoLog(sh) || ''));
-  }
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error('shader: ' + (gl.getShaderInfoLog(sh) || ''));
   return sh;
 }
 
@@ -71,9 +69,7 @@ function program(gl: WebGLRenderingContext, vsSrc: string, fsSrc: string): WebGL
   gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vsSrc));
   gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fsSrc));
   gl.linkProgram(p);
-  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
-    throw new Error('link: ' + (gl.getProgramInfoLog(p) || ''));
-  }
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) throw new Error('link: ' + (gl.getProgramInfoLog(p) || ''));
   return p;
 }
 
@@ -81,22 +77,11 @@ function drawQuad(gl: WebGLRenderingContext, prog: WebGLProgram): void {
   const buf = gl.createBuffer();
   if (!buf) return;
   gl.bindBuffer(gl.ARRAY_BUFFER, buf);
-  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
-    -1, -1, 0.5, 0.5, 0.5,
-    1, -1, 0.5, 0.5, 0.5,
-    1, 1, 0.5, 0.5, 0.5,
-    -1, 1, 0.5, 0.5, 0.5,
-  ]), gl.STATIC_DRAW);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 0.5, 0.5, 0.5, 1, -1, 0.5, 0.5, 0.5, 1, 1, 0.5, 0.5, 0.5, -1, 1, 0.5, 0.5, 0.5]), gl.STATIC_DRAW);
   const aPos = gl.getAttribLocation(prog, 'aP');
   const aCol = gl.getAttribLocation(prog, 'aC');
-  if (aPos >= 0) {
-    gl.enableVertexAttribArray(aPos);
-    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0);
-  }
-  if (aCol >= 0) {
-    gl.enableVertexAttribArray(aCol);
-    gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 20, 8);
-  }
+  if (aPos >= 0) { gl.enableVertexAttribArray(aPos); gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0); }
+  if (aCol >= 0) { gl.enableVertexAttribArray(aCol); gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 20, 8); }
   gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
   if (aPos >= 0) gl.disableVertexAttribArray(aPos);
   if (aCol >= 0) gl.disableVertexAttribArray(aCol);
@@ -144,6 +129,8 @@ const GRAVITY = 24;        // blocks/s^2 (design bible)
 const JUMP_V = 8.4;        // ~1.25 block jump
 const WALK_SPEED = 4.6;
 const SENS = 0.0023;
+const EYE = 1.62;
+const PRAD = 0.3;
 
 function boot(): void {
   const glcEl = document.getElementById('gl') as HTMLCanvasElement | null;
@@ -153,29 +140,42 @@ function boot(): void {
   let ctx: WebGLRenderingContext | null =
     (glc.getContext('webgl', { antialias: false }) as WebGLRenderingContext | null) ||
     (glc.getContext('experimental-webgl') as unknown as WebGLRenderingContext | null);
-  if (!ctx) {
-    console.error('CUBELAND: WebGL unavailable');
-    return;
-  }
+  if (!ctx) { console.error('CUBELAND: WebGL unavailable'); return; }
   const gl = ctx;
 
   const world = new World(1337);
   const player = new Player();
 
-  // Place the player on the guaranteed spawn plateau.
   let sp: { x: number; y: number; z: number };
-  try {
-    sp = world.spawn();
-  } catch (_e) {
-    sp = { x: 8.5, y: 34.05, z: 8.5 };
-  }
-  player.x = sp.x; player.y = sp.y + 1.62; player.z = sp.z;
+  try { sp = world.spawn(); } catch (_e) { sp = { x: 8.5, y: 34.05, z: 8.5 }; }
+  player.x = sp.x; player.y = sp.y + EYE; player.z = sp.z;
   player.yaw = Math.PI * 0.75;   // face out over the mesas
   player.pitch = -0.12;
+
+  const inv = new InvModel();      // inventory model, driven from the loop
+  // Icon contract: itemIcon(id) returns a NUMBER (color). Draw it into a
+  // local canvas and hand the CANVAS to the HUD. Never assign the number
+  // to an HTMLCanvasElement.
+  const iconDraw = (id: number, size: number): HTMLCanvasElement => {
+    const cv = document.createElement('canvas');
+    cv.width = size; cv.height = size;
+    const c2 = cv.getContext('2d');
+    if (c2) {
+      let col: string | null = null;
+      try { const n = itemIcon(id); if (typeof n === 'number') col = '#' + (n >>> 0).toString(16).padStart(8, '0'); } catch (_e) { /* fall back */ }
+      if (!col) col = id % 2 ? '#C48A4E' : '#6E5F55';
+      c2.fillStyle = col;
+      c2.fillRect(0, 0, size, size);
+    }
+    return cv;
+  };
+  const hud = makeHud(iconDraw);
+  const invUi = makeInvUi(inv, iconDraw);
 
   const keys: Record<string, boolean> = {};
   let locked = false;
   let ready = false;
+  let inventoryOpen = false;
 
   // ---- shaders / programs ---------------------------------------------------
   const pWorld = program(gl, VS_WORLD, FS_WORLD);
@@ -208,35 +208,49 @@ function boot(): void {
   function uploadChunk(cx: number, cz: number): void {
     const k = cx + ',' + cz;
     let b = glBufs.get(k);
-    if (!b) {
-      const nb = gl.createBuffer();
-      if (!nb) return;
-      b = nb;
-      glBufs.set(k, nb);
-    }
+    if (!b) { const nb = gl.createBuffer(); if (!nb) return; b = nb; glBufs.set(k, nb); }
     const data = world.meshData(cx, cz);
     gl.bindBuffer(gl.ARRAY_BUFFER, b);
     if (data.length) gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
   }
 
   // ---- input -----------------------------------------------------------------
+  function toggleInventory(): void {
+    if (inventoryOpen) closeInventory(); else openInventory();
+  }
+
+  function openInventory(): void {
+    if (inventoryOpen) return;
+    inventoryOpen = true;
+    document.exitPointerLock();
+    invUi.setOpen(true);
+  }
+
+  function closeInventory(): void {
+    if (!inventoryOpen) return;
+    inventoryOpen = false;
+    inv.absorbBench();   // bench stacks return to the grid before closing
+    invUi.setOpen(false);
+  }
+
   window.addEventListener('keydown', (e) => {
     keys[e.code] = true;
     if (e.code === 'Space') e.preventDefault();
+    // E toggles the inventory grid.
+    if (e.code === 'KeyE') { e.preventDefault(); toggleInventory(); return; }
+    // Escape closes the inventory.
+    if (e.code === 'Escape' && inventoryOpen) { e.preventDefault(); closeInventory(); return; }
+    // Hotbar select 1-9.
+    if (e.code >= 'Digit1' && e.code <= 'Digit9') { inv.sel = parseInt(e.code.slice(5), 10) - 1; }
   });
   window.addEventListener('keyup', (e) => { keys[e.code] = false; });
 
-  glc.addEventListener('click', () => {
-    if (!locked) glc.requestPointerLock();
-  });
+  glc.addEventListener('click', () => { if (!locked && !inventoryOpen) glc.requestPointerLock(); });
 
-  document.addEventListener('pointerlockchange', () => {
-    locked = (document.pointerLockElement === glc);
-  });
+  document.addEventListener('pointerlockchange', () => { locked = (document.pointerLockElement === glc); });
 
-  // Mouse-look via pointer lock (WASD movement handled in stepPlayer).
   document.addEventListener('mousemove', (e) => {
-    if (!locked) return;
+    if (!locked || inventoryOpen) return;
     player.yaw -= e.movementX * SENS;
     player.pitch -= e.movementY * SENS;
     const lim = Math.PI / 2 - 0.01;
@@ -254,18 +268,15 @@ function boot(): void {
   fit();
 
   // ---- physics -----------------------------------------------------------------
-  const EYE = 1.62;
-  const R = 0.3;
-
   function collideAxis(p: Player, axis: 'x' | 'y' | 'z', delta: number): void {
     if (delta === 0) return;
     const nx = p.x + (axis === 'x' ? delta : 0);
     const ny = p.y + (axis === 'y' ? delta : 0);
     const nz = p.z + (axis === 'z' ? delta : 0);
 
-    const x0 = Math.floor(nx - R), x1 = Math.floor(nx + R);
+    const x0 = Math.floor(nx - PRAD), x1 = Math.floor(nx + PRAD);
     const y0 = Math.floor(ny - EYE), y1 = Math.floor(ny);
-    const z0 = Math.floor(nz - R), z1 = Math.floor(nz + R);
+    const z0 = Math.floor(nz - PRAD), z1 = Math.floor(nz + PRAD);
 
     for (let bx = x0; bx <= x1; bx++) {
       for (let by = y0; by <= y1; by++) {
@@ -275,10 +286,10 @@ function boot(): void {
             if (delta < 0) { p.y = by + 1; p.vy = 0; p.onGround = true; }
             else { p.y = by - EYE - 0.001; p.vy = 0; }
           } else if (axis === 'x') {
-            p.x = delta > 0 ? bx - R - 0.001 : bx + 1 + R + 0.001;
+            p.x = delta > 0 ? bx - PRAD - 0.001 : bx + 1 + PRAD + 0.001;
             p.vx = 0;
           } else {
-            p.z = delta > 0 ? bz - R - 0.001 : bz + 1 + R + 0.001;
+            p.z = delta > 0 ? bz - PRAD - 0.001 : bz + 1 + PRAD + 0.001;
             p.vz = 0;
           }
           return;
@@ -289,6 +300,8 @@ function boot(): void {
   }
 
   function stepPlayer(dt: number): void {
+    if (inventoryOpen) return; // freeze the world while the grid is open
+
     const fwdX = -Math.sin(player.yaw), fwdZ = -Math.cos(player.yaw);
     const rgtX = Math.cos(player.yaw), rgtZ = -Math.sin(player.yaw);
 
@@ -308,8 +321,7 @@ function boot(): void {
       player.vy = JUMP_V;
     }
 
-    // Gravity + terminal fall clamp.
-    player.vy -= GRAVITY * dt;
+    player.vy -= GRAVITY * dt;   // gravity + terminal fall clamp
     if (player.vy < -40) player.vy = -40;
 
     collideAxis(player, 'x', player.vx * dt);
@@ -340,18 +352,9 @@ function boot(): void {
       if (!size) continue;
 
       const count = size / 36;
-      if (aPw >= 0) {
-        gl.enableVertexAttribArray(aPw);
-        gl.vertexAttribPointer(aPw, 3, gl.FLOAT, false, 36, 0);
-      }
-      if (aNw >= 0) {
-        gl.enableVertexAttribArray(aNw);
-        gl.vertexAttribPointer(aNw, 3, gl.FLOAT, false, 36, 12);
-      }
-      if (aCw >= 0) {
-        gl.enableVertexAttribArray(aCw);
-        gl.vertexAttribPointer(aCw, 3, gl.FLOAT, false, 36, 24);
-      }
+      if (aPw >= 0) { gl.enableVertexAttribArray(aPw); gl.vertexAttribPointer(aPw, 3, gl.FLOAT, false, 36, 0); }
+      if (aNw >= 0) { gl.enableVertexAttribArray(aNw); gl.vertexAttribPointer(aNw, 3, gl.FLOAT, false, 36, 12); }
+      if (aCw >= 0) { gl.enableVertexAttribArray(aCw); gl.vertexAttribPointer(aCw, 3, gl.FLOAT, false, 36, 24); }
       gl.drawArrays(gl.TRIANGLES, 0, count);
 
       if (aPw >= 0) gl.disableVertexAttribArray(aPw);
@@ -361,7 +364,7 @@ function boot(): void {
   }
 
   function drawSky(proj: Float32Array, viewRot: Float32Array): void {
-    const mvp = mul(proj, viewRot);
+    const mvp = mul(proj, viewRot); // (kept: matrix path identical to before)
     gl.useProgram(pSky);
     if (uResSky) gl.uniform2f(uResSky, glc.width, glc.height);
     drawQuad(gl, pSky);
@@ -375,7 +378,6 @@ function boot(): void {
     const cx = (vp[0] * wx + vp[4] * wy + vp[8] * wz + vp[12]) / (vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15]);
     const cy = (vp[5] * wx + vp[9] * wy + vp[13] * wz + vp[15]) / (vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15]);
     if (cx < -2 || cx > 2 || cy < -2 || cy > 2) return; // behind camera
-    const mvp = mul(proj, viewRot);
     gl.useProgram(pSun);
     if (uResSun) gl.uniform2f(uResSun, glc.width, glc.height);
     if (uSP) gl.uniform2f(uSP, (cx * 0.5 + 0.5) * glc.width, (cy * 0.5 + 0.5) * glc.height);
@@ -393,15 +395,15 @@ function boot(): void {
     last = now;
     if (dt > 0.05) dt = 0.05;
 
+    // InvModel is driven from the loop: re-resolve the craft result each frame
+    // so the output slot stays live as the bench changes.
+    if (inventoryOpen) invUi.sync(inv);
+
     stepPlayer(dt);
 
     // Keep the chunk ring around the player built + meshed.
     let dirty: { cx: number; cz: number }[] = [];
-    try {
-      dirty = world.sync(player.x, player.z);
-    } catch (_e) {
-      dirty = [];
-    }
+    try { dirty = world.sync(player.x, player.z); } catch (_e) { dirty = []; }
     for (const m of dirty) uploadChunk(m.cx, m.cz);
 
     // Drop buffers that left the view ring.
@@ -437,7 +439,11 @@ function boot(): void {
 
     drawWorld(mvp);
 
-    // HUD debug + fps.
+    // HUD: hotbar mirrors the first nine inventory slots; held-item name.
+    hud.setSlots(inv.hotbarView());
+    const held = inv.slots[inv.sel];
+    if (held) hud.toast(itemName(held.id), 1);
+
     fpsN++;
     if (now - fpsT > 500) {
       const fps = Math.round((fpsN * 1000) / (now - fpsT));
@@ -446,8 +452,8 @@ function boot(): void {
       if (dbg) {
         dbg.textContent =
           'CUBELAND  fps ' + fps + '\n' +
-          'x ' + player.x.toFixed(1) + '  y ' + (player.y - EYE).toFixed(1) + '  z ' + player.z.toFixed(1) + '\n' +
-          (locked ? 'pointer locked — WASD move · Space jump' : 'click to capture the mouse');
+          'x ' + player.x.toFixed(1) + '  y ' + eyeY.toFixed(1) + '  z ' + player.z.toFixed(1) + '\n' +
+          (inventoryOpen ? 'inventory open — E or Esc to close' : (locked ? 'pointer locked — WASD move · Space jump · E inventory' : 'click to capture the mouse'));
       }
     }
 
@@ -462,8 +468,5 @@ function boot(): void {
 
   requestAnimationFrame(frame);
 }
-
-// Deterministic seed fallback (mulberry32 keeps the import meaningful).
-void mulberry32;
 
 boot();
