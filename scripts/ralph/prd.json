@@ -52,15 +52,21 @@
     {
       "id": "US-003",
       "title": "Break and place blocks",
-      "description": "Hold to break the targeted block. Right-click places the selected hotbar block. Hotbar keys 1-9. Visible hotbar UI with selected slot. Breaking takes time and shows a crack or progress.",
+      "description": "Hold to break the targeted block. Right-click places the selected hotbar block. Hotbar keys 1-9. Visible hotbar UI with selected slot. Breaking takes time and shows a crack or progress. HARD RULES: do NOT emit index.html \u2014 build all hotbar/HUD UI from TypeScript DOM creation in a new src/hud.ts (DUSK style per the brief: skewed plum slots, orange selected border). Emit only files you change, each complete. blocks.ts and inventory.ts are frozen \u2014 use their existing exports.",
       "acceptanceCriteria": [
         "Break/place in player or main",
         "Hotbar 1-9 exists",
         "npx tsc --noEmit exits 0"
       ],
       "priority": 3,
-      "passes": false,
-      "verify": "npx tsc --noEmit && grep -R -q -E 'break|mine|destroy' src && grep -R -q -E 'place|setBlock' src && grep -R -q -E 'hotbar|Digit1' src"
+      "passes": true,
+      "verify": "npx tsc --noEmit && grep -R -q -E 'break|mine|destroy' src && grep -R -q -E 'place|setBlock' src && grep -R -q -E 'hotbar|Digit1' src",
+      "allowedFiles": [
+        "src/player.ts",
+        "src/main.ts",
+        "src/hud.ts",
+        "src/world.ts"
+      ]
     },
     {
       "id": "US-004",
