@@ -27,6 +27,7 @@ LAST_VERIFY = SCRIPT_DIR / "LAST_VERIFY.txt"
 QWEN_MD = SCRIPT_DIR / "QWEN.md"
 BRIEF_PATH = SCRIPT_DIR / "BRIEF.md"
 ALLOWED_FILES: set = set()
+PROTECT: dict = {}
 
 QWEN_SSH = os.environ.get("QWEN_SSH", "studio")
 QWEN_API = os.environ.get("QWEN_API", "http://127.0.0.1:1234/v1/chat/completions")
@@ -305,6 +306,12 @@ def write_files(text: str, dest: Path) -> list[str]:
         if ALLOWED_FILES and rel not in ALLOWED_FILES:
             print(f"  skip {rel}: not in story allowedFiles", flush=True)
             continue
+        req = PROTECT.get(rel)
+        if req:
+            missing = [m for m in req if m not in content]
+            if missing:
+                print(f"  skip {rel}: write drops protected symbols {missing}", flush=True)
+                continue
         body = _clean_file_body(content)
         if not body.strip() or body.lstrip().startswith("### FILE:"):
             continue
@@ -525,6 +532,8 @@ def main() -> int:
     story = next_story(prd)
     global ALLOWED_FILES
     ALLOWED_FILES = set(story.get("allowedFiles") or [])
+    global PROTECT
+    PROTECT = story.get("protect") or {}
     if story is None:
         print("<promise>COMPLETE</promise>")
         return 0

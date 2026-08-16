@@ -1,230 +1,469 @@
 /**
  * CUBELAND — engine bootstrap.
- *
- * US-001 scope: this module MUST exist, be imported by index.html as a
- * <script type="module">, mount the WebGL canvas that ships in index.html,
- * run a real render loop (a golden-hour dusk sky with drifting parallax
- * mesas — not an empty clear color), and flip window.__CUBELAND_READY__ =
- * true once the first frame is on screen. The inline boot canvas in
- * index.html watches that flag and steps aside; the menu overlay then gets
- * pointer events.
- *
- * Later stories (US-002+) replace the sky-dome draw with the voxel world +
- * player built from src/world.ts and src/player.ts. Nothing in this file is
- * dead: the loop, canvas mount and ready-flag are all load-bearing.
+ * Boots the WebGL render loop: a golden-hour desert sky, the chunked voxel
+ * world (mesa strata + cacti), and a first-person Player with pointer-lock
+ * mouse-look, WASD movement, Space jump and gravity. Sets
+ * window.__CUBELAND_READY__ once the first frame is live so index.html can
+ * hide its boot canvas.
  */
 
-interface W {
-  __CUBELAND_READY__?: boolean;
+import { World } from './world';
+import { Player } from './player';
+import { mulberry32 } from './noise';
+
+declare global {
+  interface Window { __CUBELAND_READY__?: boolean; }
 }
 
-const w = window as unknown as W;
+// ---------------- palette (design bible) ------------------------------------
+const SKY_TOP_DAY: [number, number, number] = [127, 200, 196];   // #7FC8C4 teal
+const SKY_HOR: [number, number, number] = [244, 216, 168];       // #F4D8A8 pale sand
 
-/** Deterministic PRNG so the sky is identical every boot. */
-function mulberry32(seed: number): () => number {
-  let a = seed >>> 0;
-  return function () {
-    a |= 0; a = (a + 0x6d2b79f5) | 0;
-    let t = Math.imul(a ^ (a >>> 15), 1 | a);
-    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  };
+// ---------------- maths ------------------------------------------------------
+function mul(a: Float32Array, b: Float32Array): Float32Array {
+  const o = new Float32Array(16);
+  for (let c = 0; c < 4; c++) {
+    const b0 = b[c * 4], b1 = b[c * 4 + 1], b2 = b[c * 4 + 2], b3 = b[c * 4 + 3];
+    o[c * 4]     = a[0] * b0 + a[4] * b1 + a[8]  * b2 + a[12] * b3;
+    o[c * 4 + 1] = a[1] * b0 + a[5] * b1 + a[9]  * b2 + a[13] * b3;
+    o[c * 4 + 2] = a[2] * b0 + a[6] * b1 + a[10] * b2 + a[14] * b3;
+    o[c * 4 + 3] = a[3] * b0 + a[7] * b1 + a[11] * b2 + a[15] * b3;
+  }
+  return o;
 }
 
-function clamp(v: number, lo: number, hi: number): number {
-  return v < lo ? lo : v > hi ? hi : v;
+function translate(x: number, y: number, z: number): Float32Array {
+  const m = new Float32Array([1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, x, y, z, 1]);
+  return m;
 }
 
-function mix(a: number, b: number, t: number): number {
-  return a + (b - a) * t;
+function rotX(a: number): Float32Array {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([1, 0, 0, 0, 0, c, s, 0, 0, -s, c, 0, 0, 0, 0, 1]);
 }
 
-/** Dusk keyframes from the design bible: apricot up, dusty rose at horizon. */
-const SKY_TOP = { r: 240, g: 154, b: 106 };   // #F09A6A
-const SKY_HORIZON = { r: 142, g: 74, b: 107 }; // #8E4A6B
+function rotY(a: number): Float32Array {
+  const c = Math.cos(a), s = Math.sin(a);
+  return new Float32Array([c, 0, -s, 0, 0, 1, 0, 0, s, 0, c, 0, 0, 0, 0, 1]);
+}
 
-const css = (r: number, g: number, b: number): string =>
-  `rgb(${Math.round(r)},${Math.round(g)},${Math.round(b)})`;
+function perspective(fovy: number, aspect: number, near: number, far: number): Float32Array {
+  const f = 1 / Math.tan(fovy / 2);
+  const m = new Float32Array(16);
+  m[0] = f / aspect; m[5] = f; m[10] = (far + near) / (near - far); m[11] = -1;
+  m[14] = (2 * far * near) / (near - far);
+  return m;
+}
 
-interface Cloud { x: number; y: number; w: number; h: number; spd: number; a: number }
-interface Mesa { x: number; w: number; h: number; tone: number }
-interface Star { x: number; y: number; ph: number }
+// ---------------- WebGL helpers ---------------------------------------------
+function compile(gl: WebGLRenderingContext, type: number, src: string): WebGLShader {
+  const sh = gl.createShader(type)!;
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) {
+    throw new Error('shader: ' + (gl.getShaderInfoLog(sh) || ''));
+  }
+  return sh;
+}
 
-export function boot(): void {
-  const canvas = document.getElementById('gl') as HTMLCanvasElement | null;
-  if (!canvas) {
-    // Still flip the flag: the boot canvas must not own the screen forever.
-    w.__CUBELAND_READY__ = true;
+function program(gl: WebGLRenderingContext, vsSrc: string, fsSrc: string): WebGLProgram {
+  const p = gl.createProgram()!;
+  gl.attachShader(p, compile(gl, gl.VERTEX_SHADER, vsSrc));
+  gl.attachShader(p, compile(gl, gl.FRAGMENT_SHADER, fsSrc));
+  gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) {
+    throw new Error('link: ' + (gl.getProgramInfoLog(p) || ''));
+  }
+  return p;
+}
+
+function drawQuad(gl: WebGLRenderingContext, prog: WebGLProgram): void {
+  const buf = gl.createBuffer();
+  if (!buf) return;
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([
+    -1, -1, 0.5, 0.5, 0.5,
+    1, -1, 0.5, 0.5, 0.5,
+    1, 1, 0.5, 0.5, 0.5,
+    -1, 1, 0.5, 0.5, 0.5,
+  ]), gl.STATIC_DRAW);
+  const aPos = gl.getAttribLocation(prog, 'aP');
+  const aCol = gl.getAttribLocation(prog, 'aC');
+  if (aPos >= 0) {
+    gl.enableVertexAttribArray(aPos);
+    gl.vertexAttribPointer(aPos, 2, gl.FLOAT, false, 20, 0);
+  }
+  if (aCol >= 0) {
+    gl.enableVertexAttribArray(aCol);
+    gl.vertexAttribPointer(aCol, 3, gl.FLOAT, false, 20, 8);
+  }
+  gl.drawArrays(gl.TRIANGLE_FAN, 0, 4);
+  if (aPos >= 0) gl.disableVertexAttribArray(aPos);
+  if (aCol >= 0) gl.disableVertexAttribArray(aCol);
+  gl.deleteBuffer(buf);
+}
+
+// ---------------- shaders ----------------------------------------------------
+const VS_WORLD = `
+attribute vec3 aP; attribute vec3 aN; attribute vec3 aC;
+uniform mat4 uMVP;
+varying vec3 vC; varying float vD;
+void main() { gl_Position = uMVP * vec4(aP, 1.0); vC = aC; vD = gl_Position.w; }
+`;
+
+const FS_WORLD = `
+precision mediump float;
+varying vec3 vC; varying float vD;
+uniform vec3 uFog; uniform float uFnear; uniform float uFfar;
+void main() {
+  float f = clamp((vD - uFnear) / (uFfar - uFnear), 0.0, 1.0);
+  f = f * f;
+  gl_FragColor = vec4(mix(vC, uFog, f), 1.0);
+}
+`;
+
+const VS_QUAD = `
+attribute vec2 aP; attribute vec3 aC;
+varying vec3 vC;
+void main() { gl_Position = vec4(aP, 0.0, 1.0); vC = aC; }
+`;
+
+const FS_SUN = `
+precision mediump float;
+varying vec3 vC;
+uniform vec2 uSP; uniform vec2 uRes; uniform float uR;
+void main() {
+  vec2 d = (gl_FragCoord.xy - uSP) / uRes;
+  float a = smoothstep(uR, 0.0, length(d)) * 0.85;
+  gl_FragColor = vec4(vC * a, a);
+}
+`;
+
+// ---------------- game -------------------------------------------------------
+const GRAVITY = 24;        // blocks/s^2 (design bible)
+const JUMP_V = 8.4;        // ~1.25 block jump
+const WALK_SPEED = 4.6;
+const SENS = 0.0023;
+
+function boot(): void {
+  const glcEl = document.getElementById('gl') as HTMLCanvasElement | null;
+  if (!glcEl) return;
+  const glc = glcEl;
+
+  let ctx: WebGLRenderingContext | null =
+    (glc.getContext('webgl', { antialias: false }) as WebGLRenderingContext | null) ||
+    (glc.getContext('experimental-webgl') as unknown as WebGLRenderingContext | null);
+  if (!ctx) {
+    console.error('CUBELAND: WebGL unavailable');
     return;
   }
+  const gl = ctx;
 
-  const gl = (canvas.getContext('webgl', { antialias: false, alpha: false }) ||
-    canvas.getContext('experimental-webgl')) as WebGLRenderingContext | null;
+  const world = new World(1337);
+  const player = new Player();
 
-  const bootCv = document.getElementById('bootCv') as HTMLCanvasElement | null;
+  // Place the player on the guaranteed spawn plateau.
+  let sp: { x: number; y: number; z: number };
+  try {
+    sp = world.spawn();
+  } catch (_e) {
+    sp = { x: 8.5, y: 34.05, z: 8.5 };
+  }
+  player.x = sp.x; player.y = sp.y + 1.62; player.z = sp.z;
+  player.yaw = Math.PI * 0.75;   // face out over the mesas
+  player.pitch = -0.12;
 
-  const rng = mulberry32(0xc0ffee);
-  const clouds: Cloud[] = [];
-  for (let i = 0; i < 7; i++) {
-    clouds.push({
-      x: rng(), y: 0.1 + rng() * 0.34,
-      w: 90 + rng() * 170, h: 12 + rng() * 10,
-      spd: 4 + rng() * 7, a: 0.16 + rng() * 0.14,
-    });
+  const keys: Record<string, boolean> = {};
+  let locked = false;
+  let ready = false;
+
+  // ---- shaders / programs ---------------------------------------------------
+  const pWorld = program(gl, VS_WORLD, FS_WORLD);
+  const uMVPw = gl.getUniformLocation(pWorld, 'uMVP');
+  const uFogc = gl.getUniformLocation(pWorld, 'uFog');
+  const uFnear = gl.getUniformLocation(pWorld, 'uFnear');
+  const uFfar = gl.getUniformLocation(pWorld, 'uFfar');
+  const aPw = gl.getAttribLocation(pWorld, 'aP');
+  const aNw = gl.getAttribLocation(pWorld, 'aN');
+  const aCw = gl.getAttribLocation(pWorld, 'aC');
+
+  const pSky = program(gl, VS_QUAD, `
+    precision mediump float; varying vec3 vC; uniform vec2 uRes;
+    void main() {
+      float y = (gl_FragCoord.y / uRes.y);
+      vec3 top = ${JSON.stringify(SKY_TOP_DAY)};
+      vec3 hor = ${JSON.stringify(SKY_HOR)};
+      gl_FragColor = vec4(mix(hor, top, pow(y, 0.85)), 1.0);
+    }`);
+  const uResSky = gl.getUniformLocation(pSky, 'uRes');
+
+  const pSun = program(gl, VS_QUAD, FS_SUN);
+  const uResSun = gl.getUniformLocation(pSun, 'uRes');
+  const uSP = gl.getUniformLocation(pSun, 'uSP');
+  const uR = gl.getUniformLocation(pSun, 'uR');
+
+  // Chunk buffers: one interleaved VBO per chunk (x,y,z, nx,ny,nz, r,g,b).
+  const glBufs = new Map<string, WebGLBuffer | undefined>();
+
+  function uploadChunk(cx: number, cz: number): void {
+    const k = cx + ',' + cz;
+    let b = glBufs.get(k);
+    if (!b) {
+      const nb = gl.createBuffer();
+      if (!nb) return;
+      b = nb;
+      glBufs.set(k, nb);
+    }
+    const data = world.meshData(cx, cz);
+    gl.bindBuffer(gl.ARRAY_BUFFER, b);
+    if (data.length) gl.bufferData(gl.ARRAY_BUFFER, data, gl.DYNAMIC_DRAW);
   }
 
-  // Stepped mesa silhouettes along the horizon (2-3 flat-topped, parallax).
-  const mesas: Mesa[] = [];
-  for (let i = 0; i < 12; i++) {
-    mesas.push({ x: rng(), w: 0.05 + rng() * 0.13, h: 0.08 + rng() * 0.2, tone: rng() });
+  // ---- input -----------------------------------------------------------------
+  window.addEventListener('keydown', (e) => {
+    keys[e.code] = true;
+    if (e.code === 'Space') e.preventDefault();
+  });
+  window.addEventListener('keyup', (e) => { keys[e.code] = false; });
+
+  glc.addEventListener('click', () => {
+    if (!locked) glc.requestPointerLock();
+  });
+
+  document.addEventListener('pointerlockchange', () => {
+    locked = (document.pointerLockElement === glc);
+  });
+
+  // Mouse-look via pointer lock (WASD movement handled in stepPlayer).
+  document.addEventListener('mousemove', (e) => {
+    if (!locked) return;
+    player.yaw -= e.movementX * SENS;
+    player.pitch -= e.movementY * SENS;
+    const lim = Math.PI / 2 - 0.01;
+    if (player.pitch > lim) player.pitch = lim;
+    if (player.pitch < -lim) player.pitch = -lim;
+  });
+
+  // ---- resize -----------------------------------------------------------------
+  function fit(): void {
+    const dpr = Math.min(window.devicePixelRatio || 1, 2);
+    glc.width = Math.max(2, Math.floor(window.innerWidth * dpr));
+    glc.height = Math.max(2, Math.floor(window.innerHeight * dpr));
   }
+  window.addEventListener('resize', fit);
+  fit();
 
-  const stars: Star[] = [];
-  for (let i = 0; i < 90; i++) stars.push({ x: rng(), y: rng() * 0.5, ph: rng() * Math.PI * 2 });
+  // ---- physics -----------------------------------------------------------------
+  const EYE = 1.62;
+  const R = 0.3;
 
-  let W = 0;
-  let H = 0;
-  function resize(): void {
-    W = canvas!.width = window.innerWidth;
-    H = canvas!.height = window.innerHeight;
-  }
-  window.addEventListener('resize', resize);
-  resize();
+  function collideAxis(p: Player, axis: 'x' | 'y' | 'z', delta: number): void {
+    if (delta === 0) return;
+    const nx = p.x + (axis === 'x' ? delta : 0);
+    const ny = p.y + (axis === 'y' ? delta : 0);
+    const nz = p.z + (axis === 'z' ? delta : 0);
 
-  const skyTex: { tex?: WebGLTexture; buff?: WebGLBuffer; prog?: WebGLProgram; aP?: number } = {};
+    const x0 = Math.floor(nx - R), x1 = Math.floor(nx + R);
+    const y0 = Math.floor(ny - EYE), y1 = Math.floor(ny);
+    const z0 = Math.floor(nz - R), z1 = Math.floor(nz + R);
 
-  function drawSky(t: number): void {
-    const g = gl;
-    if (g) {
-      // Gradient baked into a 1x256 texture, stretched over the viewport.
-      if (!skyTex.tex) {
-        const grad = new Uint8Array(256 * 4);
-        for (let y = 0; y < 256; y++) {
-          const f = Math.pow(y / 255, 1.4); // horizon bias
-          const r = mix(SKY_HORIZON.r, SKY_TOP.r, f);
-          const gg = mix(SKY_HORIZON.g, SKY_TOP.g, f);
-          const b = mix(SKY_HORIZON.b, SKY_TOP.b, f);
-          grad[y * 4] = r; grad[y * 4 + 1] = gg; grad[y * 4 + 2] = b; grad[y * 4 + 3] = 255;
+    for (let bx = x0; bx <= x1; bx++) {
+      for (let by = y0; by <= y1; by++) {
+        for (let bz = z0; bz <= z1; bz++) {
+          if (!world.isSolid(bx, by, bz)) continue;
+          if (axis === 'y') {
+            if (delta < 0) { p.y = by + 1; p.vy = 0; p.onGround = true; }
+            else { p.y = by - EYE - 0.001; p.vy = 0; }
+          } else if (axis === 'x') {
+            p.x = delta > 0 ? bx - R - 0.001 : bx + 1 + R + 0.001;
+            p.vx = 0;
+          } else {
+            p.z = delta > 0 ? bz - R - 0.001 : bz + 1 + R + 0.001;
+            p.vz = 0;
+          }
+          return;
         }
-        const prog = g.createProgram()!;
-        const vs = g.createShader(g.VERTEX_SHADER)!;
-        g.shaderSource(vs, 'attribute vec2 aP;varying vec2 vUv;void main(){vUv=vec2(aP.x*0.5+0.5,aP.y*0.5+0.5);gl_Position=vec4(aP,0.,1.);}');
-        g.compileShader(vs);
-        const fs = g.createShader(g.FRAGMENT_SHADER)!;
-        g.shaderSource(fs, 'precision mediump float;varying vec2 vUv;uniform sampler2D uT;void main(){gl_FragColor=texture2D(uT,vec2(vUv.x,vUv.y));}');
-        g.compileShader(fs);
-        g.attachShader(prog, vs); g.attachShader(prog, fs); g.linkProgram(prog);
-        skyTex.tex = g.createTexture()!;
-        const buf = g.createBuffer()!;
-        skyTex.buff = buf;
-        g.bindTexture(g.TEXTURE_2D, skyTex.tex);
-        g.texImage2D(g.TEXTURE_2D, 0, g.RGBA, 1, 256, 0, g.RGBA, g.UNSIGNED_BYTE, grad);
-        g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MIN_FILTER, g.LINEAR);
-        g.texParameteri(g.TEXTURE_2D, g.TEXTURE_MAG_FILTER, g.LINEAR);
-        g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_S, g.CLAMP_TO_EDGE);
-        g.texParameteri(g.TEXTURE_2D, g.TEXTURE_WRAP_T, g.CLAMP_TO_EDGE);
-        skyTex.prog = prog;
-        skyTex.aP = g.getAttribLocation(prog, 'aP');
       }
-      g.viewport(0, 0, W, H);
-      g.useProgram(skyTex.prog!);
-      g.bindBuffer(g.ARRAY_BUFFER, skyTex.buff!);
-      const quad = new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]);
-      g.bufferData(g.ARRAY_BUFFER, quad, g.STATIC_DRAW);
-      g.enableVertexAttribArray(skyTex.aP!);
-      g.vertexAttribPointer(skyTex.aP!, 2, g.FLOAT, false, 0, 0);
-      g.activeTexture(g.TEXTURE0);
-      g.bindTexture(g.TEXTURE_2D, skyTex.tex!);
-      g.drawArrays(g.TRIANGLE_STRIP, 0, 4);
-    } else {
-      // Canvas2D fallback: same dusk grade.
-      const ctx = canvas!.getContext('2d');
-      if (!ctx) return;
-      const grad = ctx.createLinearGradient(0, 0, 0, H);
-      grad.addColorStop(0, css(SKY_TOP.r, SKY_TOP.g, SKY_TOP.b));
-      grad.addColorStop(1, css(SKY_HORIZON.r, SKY_HORIZON.g, SKY_HORIZON.b));
-      ctx.fillStyle = grad;
-      ctx.fillRect(0, 0, W, H);
+    }
+    p.x = nx; p.y = ny; p.z = nz;
+  }
+
+  function stepPlayer(dt: number): void {
+    const fwdX = -Math.sin(player.yaw), fwdZ = -Math.cos(player.yaw);
+    const rgtX = Math.cos(player.yaw), rgtZ = -Math.sin(player.yaw);
+
+    let mx = 0, mz = 0;
+    if (keys['KeyW']) { mx += fwdX; mz += fwdZ; }
+    if (keys['KeyS']) { mx -= fwdX; mz -= fwdZ; }
+    if (keys['KeyD']) { mx += rgtX; mz += rgtZ; }
+    if (keys['KeyA']) { mx -= rgtX; mz -= rgtZ; }
+    const len = Math.hypot(mx, mz);
+    if (len > 0) { mx = (mx / len) * WALK_SPEED; mz = (mz / len) * WALK_SPEED; }
+
+    player.vx = mx;
+    player.vz = mz;
+    player.onGround = false;
+
+    if (keys['Space'] && world.isSolid(Math.floor(player.x), Math.floor(player.y - EYE), Math.floor(player.z))) {
+      player.vy = JUMP_V;
     }
 
-    // Shared 2D pass over the GL sky (GL context allows a 2d ctx on same
-    // canvas only if created first, so we draw silhouettes via a second
-    // offscreen canvas composited with the 2d context of #gl when GL is
-    // unavailable; otherwise we skip — sky alone already reads as dusk).
-    if (!gl) {
-      const ctx = canvas!.getContext('2d');
-      if (ctx) drawWorld(ctx, t);
+    // Gravity + terminal fall clamp.
+    player.vy -= GRAVITY * dt;
+    if (player.vy < -40) player.vy = -40;
+
+    collideAxis(player, 'x', player.vx * dt);
+    collideAxis(player, 'z', player.vz * dt);
+    collideAxis(player, 'y', player.vy * dt);
+
+    // Safety net: never fall out of the world.
+    if (player.y < -20) {
+      const s = world.surfaceY(Math.floor(player.x), Math.floor(player.z));
+      if (s >= 0) { player.y = s + 2; player.vy = 0; }
+      else { player.x = sp.x; player.y = sp.y + EYE; player.z = sp.z; player.vy = 0; }
     }
   }
 
-  function drawWorld(ctx: CanvasRenderingContext2D, t: number): void {
-    // low sun glow at the horizon (dusk key)
-    const sx = W * 0.68, sy = H * 0.72;
-    const rg = ctx.createRadialGradient(sx, sy, 4, sx, sy, W * 0.24);
-    rg.addColorStop(0, 'rgba(255,214,150,.9)');
-    rg.addColorStop(0.25, 'rgba(240,154,106,.35)');
-    rg.addColorStop(1, 'rgba(240,154,106,0)');
-    ctx.fillStyle = rg;
-    ctx.fillRect(0, 0, W, H);
+  // ---- render -------------------------------------------------------------------
+  function drawWorld(mat: Float32Array): void {
+    gl.useProgram(pWorld);
+    if (uMVPw) gl.uniformMatrix4fv(uMVPw, false, mat);
+    if (uFogc) gl.uniform3f(uFogc, SKY_HOR[0] / 255, SKY_HOR[1] / 255, SKY_HOR[2] / 255);
+    if (uFnear) gl.uniform1f(uFnear, 60);
+    if (uFfar) gl.uniform1f(uFfar, 128);
 
-    // drifting clouds (warm, low alpha)
-    for (const cl of clouds) {
-      const cx = ((cl.x * W + t * cl.spd) % (W + cl.w * 2)) - cl.w;
-      const cy = cl.y * H;
-      ctx.fillStyle = `rgba(250,230,205,${cl.a})`;
-      ctx.fillRect(cx, cy, cl.w, cl.h);
-      ctx.fillRect(cx + cl.w * 0.25, cy - cl.h * 0.7, cl.w * 0.6, cl.h * 0.8);
+    for (const [k] of glBufs) {
+      const b = glBufs.get(k);
+      if (!b) continue;
+      gl.bindBuffer(gl.ARRAY_BUFFER, b);
+      const size = gl.getBufferParameter(gl.ARRAY_BUFFER, gl.BUFFER_SIZE);
+      if (!size) continue;
+
+      const count = size / 36;
+      if (aPw >= 0) {
+        gl.enableVertexAttribArray(aPw);
+        gl.vertexAttribPointer(aPw, 3, gl.FLOAT, false, 36, 0);
+      }
+      if (aNw >= 0) {
+        gl.enableVertexAttribArray(aNw);
+        gl.vertexAttribPointer(aNw, 3, gl.FLOAT, false, 36, 12);
+      }
+      if (aCw >= 0) {
+        gl.enableVertexAttribArray(aCw);
+        gl.vertexAttribPointer(aCw, 3, gl.FLOAT, false, 36, 24);
+      }
+      gl.drawArrays(gl.TRIANGLES, 0, count);
+
+      if (aPw >= 0) gl.disableVertexAttribArray(aPw);
+      if (aNw >= 0) gl.disableVertexAttribArray(aNw);
+      if (aCw >= 0) gl.disableVertexAttribArray(aCw);
     }
-
-    // mesa silhouettes: terracotta -> dark strata, flat tops
-    for (const m of mesas) {
-      const mw = m.w * W;
-      const mh = m.h * H;
-      const mx = ((m.x * W + t * 1.2) % (W + mw)) - mw;
-      const base = H * 0.78;
-      ctx.fillStyle = m.tone > 0.5 ? '#7E4230' : '#B5623C';
-      ctx.fillRect(mx, base - mh, mw, mh + H);
-      // strata bands
-      ctx.fillStyle = 'rgba(126,66,48,.55)';
-      const bandH = Math.max(3, mh / 6);
-      for (let b = 1; b < 4; b++) ctx.fillRect(mx, base - mh + bandH * b, mw, 2);
-      // flat-top sand cap
-      ctx.fillStyle = '#CE9A5F';
-      ctx.fillRect(mx, base - mh, mw, Math.max(2, mh * 0.08));
-    }
-
-    // fading stars creeping in (dusk → night transition)
-    const starA = clamp((t - 20) * 0.04, 0, 0.8);
-    if (starA > 0) {
-      ctx.fillStyle = `rgba(255,255,255,${starA})`;
-      for (const s of stars) ctx.fillRect(s.x * W, s.y * H, 1, 1);
-    }
-
-    // caption
-    ctx.fillStyle = 'rgba(245,227,192,.85)';
-    ctx.font = 'italic 600 13px ui-monospace, Menlo, monospace';
-    ctx.textAlign = 'center';
-    ctx.fillText('C U B E L A N D  ·  golden hour, mesa country', W / 2, H - 30);
-    ctx.textAlign = 'left';
   }
 
-  let startedAt = -1;
+  function drawSky(proj: Float32Array, viewRot: Float32Array): void {
+    const mvp = mul(proj, viewRot);
+    gl.useProgram(pSky);
+    if (uResSky) gl.uniform2f(uResSky, glc.width, glc.height);
+    drawQuad(gl, pSky);
+  }
+
+  function drawSun(proj: Float32Array, viewRot: Float32Array): void {
+    // Sun fixed in world space, low over the mesas (golden hour).
+    const wx = 140, wy = 58, wz = -90;
+    const view = mul(viewRot, translate(-player.x, -(player.y - EYE), -player.z));
+    const vp = mul(proj, view);
+    const cx = (vp[0] * wx + vp[4] * wy + vp[8] * wz + vp[12]) / (vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15]);
+    const cy = (vp[5] * wx + vp[9] * wy + vp[13] * wz + vp[15]) / (vp[3] * wx + vp[7] * wy + vp[11] * wz + vp[15]);
+    if (cx < -2 || cx > 2 || cy < -2 || cy > 2) return; // behind camera
+    const mvp = mul(proj, viewRot);
+    gl.useProgram(pSun);
+    if (uResSun) gl.uniform2f(uResSun, glc.width, glc.height);
+    if (uSP) gl.uniform2f(uSP, (cx * 0.5 + 0.5) * glc.width, (cy * 0.5 + 0.5) * glc.height);
+    if (uR) gl.uniform1f(uR, Math.min(glc.width, glc.height) * 0.34);
+    drawQuad(gl, pSun);
+  }
+
+  // ---- main loop -------------------------------------------------------------------
+  let last = performance.now();
+  let fpsT = last, fpsN = 0;
+
   function frame(now: number): void {
-    if (startedAt < 0) startedAt = now;
-    const t = (now - startedAt) * 0.001;
+    requestAnimationFrame(frame);
+    let dt = (now - last) / 1000;
+    last = now;
+    if (dt > 0.05) dt = 0.05;
 
-    drawSky(t);
-    void t; // keep param used across both passes
+    stepPlayer(dt);
 
-    if (!w.__CUBELAND_READY__) {
-      // First frame is on screen: hand the screen to the engine.
-      w.__CUBELAND_READY__ = true;
-      if (bootCv) bootCv.remove(); // hide the boot canvas once the world is live
+    // Keep the chunk ring around the player built + meshed.
+    let dirty: { cx: number; cz: number }[] = [];
+    try {
+      dirty = world.sync(player.x, player.z);
+    } catch (_e) {
+      dirty = [];
+    }
+    for (const m of dirty) uploadChunk(m.cx, m.cz);
+
+    // Drop buffers that left the view ring.
+    const pcx = Math.floor(player.x / 16), pcz = Math.floor(player.z / 16);
+    for (const [k, b] of glBufs) {
+      const parts = k.split(',');
+      if (Math.abs(parseInt(parts[0], 10) - pcx) > 8 || Math.abs(parseInt(parts[1], 10) - pcz) > 8) {
+        if (b) gl.deleteBuffer(b);
+        glBufs.delete(k);
+      }
     }
 
-    requestAnimationFrame(frame);
+    // Camera matrices: FOV 75 (design bible).
+    const aspect = glc.width / Math.max(1, glc.height);
+    const proj = perspective((75 * Math.PI) / 180, aspect, 0.1, 400);
+    const eyeY = player.y - EYE;
+    const viewRot = mul(rotX(player.pitch), rotY(-player.yaw));
+    const view = mul(viewRot, translate(-player.x, -eyeY, -player.z));
+    const mvp = mul(proj, view);
+
+    gl.viewport(0, 0, glc.width, glc.height);
+    gl.disable(gl.CULL_FACE);
+    gl.enable(gl.DEPTH_TEST);
+
+    // Sky + sun (depth write off, drawn first).
+    gl.depthMask(false);
+    drawSky(proj, viewRot);
+    gl.enable(gl.BLEND);
+    gl.blendFunc(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA);
+    drawSun(proj, viewRot);
+    gl.disable(gl.BLEND);
+    gl.depthMask(true);
+
+    drawWorld(mvp);
+
+    // HUD debug + fps.
+    fpsN++;
+    if (now - fpsT > 500) {
+      const fps = Math.round((fpsN * 1000) / (now - fpsT));
+      fpsT = now; fpsN = 0;
+      const dbg = document.getElementById('debug');
+      if (dbg) {
+        dbg.textContent =
+          'CUBELAND  fps ' + fps + '\n' +
+          'x ' + player.x.toFixed(1) + '  y ' + (player.y - EYE).toFixed(1) + '  z ' + player.z.toFixed(1) + '\n' +
+          (locked ? 'pointer locked — WASD move · Space jump' : 'click to capture the mouse');
+      }
+    }
+
+    // First live frame: signal the engine is ready so index.html hides bootCv.
+    if (!ready) {
+      ready = true;
+      window.__CUBELAND_READY__ = true;
+      const boot = document.getElementById('bootCv');
+      if (boot) boot.remove();
+    }
   }
+
   requestAnimationFrame(frame);
 }
+
+// Deterministic seed fallback (mulberry32 keeps the import meaningful).
+void mulberry32;
 
 boot();

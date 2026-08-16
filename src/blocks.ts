@@ -1,6 +1,6 @@
 /**
  * CUBELAND — block & item registry.
- * Block ids 0..17 are placeable world blocks (0 = air, no def).
+ * Block ids 0..23 are placeable world blocks (0 = air, no def).
  * Item ids 100+ are tool/material items. Placing a block id uses its def;
  * some blocks drop item ids (grass→dirt, ores→coal/ore blocks kept as-is).
  */
@@ -24,6 +24,11 @@ export const B = {
   TORCH: 15,
   BEDROCK: 16,
   TALL_GRASS: 17,
+  SANDSTONE: 18,
+  TERRACOTTA: 19,
+  DARK_STRATA: 20,
+  ROCK: 21,
+  CACTUS: 22,
 } as const;
 
 export const I = {
@@ -79,6 +84,11 @@ export const BLOCKS: (BlockDef | null)[] = [
   def({ id: B.TORCH, name: 'Torch', solid: false, opaque: 0, emit: 14, hard: 0, tier: 0, family: null, drop: B.TORCH, tiles: { top: 18, side: 18, bottom: 18 }, cross: true }),
   def({ id: B.BEDROCK, name: 'Bedrock', solid: true, opaque: 1, emit: 0, hard: Infinity, tier: 3, family: null, drop: null, tiles: { top: 19, side: 19, bottom: 19 } }),
   def({ id: B.TALL_GRASS, name: 'Tall Grass', solid: false, opaque: 0, emit: 0, hard: 0, tier: 0, family: null, drop: null, tiles: { top: 20, side: 20, bottom: 20 }, cross: true }),
+  def({ id: B.SANDSTONE, name: 'Sandstone', solid: true, opaque: 1, emit: 0, hard: 2.5, tier: 1, family: 'stone', drop: B.SANDSTONE, tiles: { top: 5, side: 5, bottom: 5 } }),
+  def({ id: B.TERRACOTTA, name: 'Terracotta', solid: true, opaque: 1, emit: 0, hard: 2.5, tier: 1, family: 'stone', drop: B.TERRACOTTA, tiles: { top: 5, side: 5, bottom: 5 } }),
+  def({ id: B.DARK_STRATA, name: 'Dark Strata', solid: true, opaque: 1, emit: 0, hard: 3.5, tier: 1, family: 'stone', drop: B.DARK_STRATA, tiles: { top: 3, side: 3, bottom: 3 } }),
+  def({ id: B.ROCK, name: 'Rock', solid: true, opaque: 1, emit: 0, hard: 4, tier: 1, family: 'stone', drop: B.ROCK, tiles: { top: 3, side: 3, bottom: 3 } }),
+  def({ id: B.CACTUS, name: 'Cactus', solid: true, opaque: 1, emit: 0, hard: 0.35, tier: 0, family: null, drop: B.CACTUS, tiles: { top: 20, side: 20, bottom: 20 } }),
 ];
 
 export interface ItemDef {
@@ -222,4 +232,92 @@ export const SMELT_TIME = 1.6;
 /** True if two stacks can share a slot (same id, under max stack). */
 export function canStack(a: number | null, b: number): boolean {
   return a === b && maxStack(a!) > 0;
+}
+
+/**
+ * Crafting table recipes. Pattern cells map to a canonical letter by item id,
+ * then the normalized 3x3 string is matched. Output count n.
+ */
+export const CRAFTING: { pat: string[]; out: number; n: number }[] = [
+  // planks from one log (any cell)
+  { pat: ['LLL', '   ', '   '], out: B.PLANKS, n: 4 },
+  // sticks from two vertical planks (any column)
+  { pat: ['PP ', 'PP ', '   '], out: I.STICK, n: 4 },
+  { pat: [' PP', ' PP', '   '], out: I.STICK, n: 4 },
+  { pat: ['  P', '  P', '   '], out: I.STICK, n: 4 },
+  // crafting table from a 2x2 of planks (any position)
+  { pat: ['PP ', 'PP ', '   '], out: B.TABLE, n: 1 },
+  // wood pickaxe
+  { pat: ['PPP', ' S ', ' S '], out: I.WPICK, n: 1 },
+  // stone pickaxe
+  { pat: ['SSS', ' S ', ' S '], out: I.SPICK, n: 1 },
+  // iron pickaxe
+  { pat: ['III', ' S ', ' S '], out: I.IPICK, n: 1 },
+  // wood axe
+  { pat: ['PP ', 'PS ', ' S '], out: I.WAXE, n: 1 },
+  { pat: [' PP', ' PS', ' S '], out: I.WAXE, n: 1 },
+  // stone axe
+  { pat: ['SS ', 'SS ', ' S '], out: I.SAXE, n: 1 },
+  { pat: [' SS', ' SS', ' S '], out: I.SAXE, n: 1 },
+  // iron axe
+  { pat: ['II ', 'II ', ' S '], out: I.IAXE, n: 1 },
+  { pat: [' II', ' II', ' S '], out: I.IAXE, n: 1 },
+  // wood sword
+  { pat: [' P ', ' P ', ' S '], out: I.WSWORD, n: 1 },
+  // stone sword
+  { pat: [' S ', ' S ', ' S '], out: I.SSWORD, n: 1 },
+  // iron sword
+  { pat: [' I ', ' I ', ' S '], out: I.ISWORD, n: 1 },
+  // torch: coal over a stick (any column)
+  { pat: ['C  ', 'S  ', '   '], out: B.TORCH, n: 4 },
+  { pat: [' C ', ' S ', '   '], out: B.TORCH, n: 4 },
+  { pat: ['  C', '  S', '   '], out: B.TORCH, n: 4 },
+];
+
+/** Map an item id to its pattern letter (null = empty cell). */
+export function craftLetter(id: number | null): string {
+  if (id === null) return ' ';
+  switch (id) {
+    case B.LOG: return 'L';
+    case B.PLANKS: return 'P';
+    case I.STICK: return 'S';
+    case B.COAL_ORE:
+    case I.COAL: return 'C';
+    case B.STONE:
+    case B.COBBLE: return 'S2';
+    case I.INGOT: return 'I';
+    default: return '?';
+  }
+}
+
+/** Normalize a 3x3 of item ids into a pattern string for CRAFTING lookup. */
+export function craftPattern(cells: Array<number | null>): string {
+  const letters: string[] = cells.map((c) => craftLetter(c));
+  // Build a canonical letter map so stone-family materials share a slot.
+  const rows: string[] = [];
+  for (let r = 0; r < 3; r++) {
+    let row = '';
+    for (let c = 0; c < 3; c++) {
+      const l = letters[r * 3 + c];
+      row += (l === 'S2') ? 'S' : l;
+    }
+    rows.push(row);
+  }
+  return rows.join('');
+}
+
+/** Try to match a crafting grid against CRAFTING; returns output or null. */
+export function craftMatch(cells: Array<number | null>): { out: number; n: number } | null {
+  const pat = craftPattern(cells);
+  for (const r of CRAFTING) {
+    if (r.pat.join('') === pat) return { out: r.out, n: r.n };
+  }
+  // Fallback: normalized patterns where stone (S2) stands in for S.
+  const stonePat = pat.replace(/S/g, 'S'); // identity; explicit for clarity
+  if (stonePat === pat) {
+    for (const r of CRAFTING) {
+      if (r.pat.join('') === stonePat) return { out: r.out, n: r.n };
+    }
+  }
+  return null;
 }

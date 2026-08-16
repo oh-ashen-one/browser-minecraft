@@ -1,559 +1,333 @@
 /**
- * CUBELAND — voxel world core.
- * Infinite chunked terrain from a seed: continents, hill ridges, beaches,
- * ocean floors, forests (deterministic global tree lattice), spongy caves,
- * ore veins. Sunlight is per-column; block light (torches + lit furnaces)
- * propagates by BFS over 3x3-chunk regions. Every mutation tracks mesh
- * dirtiness, per-column sunlight refresh and a save-replay edit list so the
- * exact world can be rebuilt from {seed, edits}.
+ * CUBELAND — chunked voxel world.
+ * Mesa strata (sand -> sandstone -> terracotta bands -> rock), a few flat-topped
+ * mesas, scattered cacti. One merged mesh per chunk with baked vertex AO and
+ * aerial perspective toward the sky horizon colour (fog = horizon, no hard edge).
  */
+
 import { B, blockDef } from './blocks';
-import { h2, fbm2, fbm3, vnoise3, hashSeed, smoothstep } from './noise';
+import { hash2, fbm, valueNoise } from './noise';
 
-export const CS = 16;      // chunk size on X/Z
-export const HEIGHT = 80;  // world height in blocks
-export const SEA = 32;     // sea level (base y of the top water row)
+export const CHUNK = 16;
+const VIEW_CHUNKS = 5; // -2..+2 around the player -> 10x10 chunks
 
-export function chunkKey(cx: number, cz: number): string { return cx + ',' + cz; }
-export function posKey(x: number, y: number, z: number): string { return x + ',' + y + ',' + z; }
+const SKY_HORIZON: [number, number, number] = [244, 216, 168]; // #F4D8A8 pale sand
+const FOG_START = 30;
+const FOG_END = 110;
 
-export class Chunk {
-  cx: number; cz: number;
-  data = new Uint8Array(CS * CS * HEIGHT); // block ids, column-major
-  sun = new Uint8Array(CS * CS * HEIGHT);  // sunlight 0..15 per cell
-  blt = new Uint8Array(CS * CS * HEIGHT);  // block light 0..15 per cell
-  needsMesh = true;
+// Palette from the design bible.
+const SAND: [number, number, number] = [224, 183, 126];
+const SANDSTONE: [number, number, number] = [206, 154, 95];
+const TERRA: [number, number, number] = [181, 98, 60];
+const STRATA: [number, number, number] = [126, 66, 48];
+const ROCK: [number, number, number] = [110, 95, 85];
+const CACTUS: [number, number, number] = [95, 140, 79];
 
-  constructor(cx: number, cz: number) { this.cx = cx; this.cz = cz; }
+// Face tables: +x, -x, +y (top), -y (bottom), +z, -z.
+const FACES: { dir: [number, number, number]; shade: number; corners: Array<[number, number, number]> }[] = [
+  { dir: [1, 0, 0], shade: 0.74, corners: [[1, 0, 1], [1, 0, 0], [1, 1, 0], [1, 1, 1]] },
+  { dir: [-1, 0, 0], shade: 0.74, corners: [[0, 0, 0], [0, 0, 1], [0, 1, 1], [0, 1, 0]] },
+  { dir: [0, 1, 0], shade: 1.0, corners: [[0, 1, 0], [0, 1, 1], [1, 1, 1], [1, 1, 0]] },
+  { dir: [0, -1, 0], shade: 0.45, corners: [[0, 0, 1], [0, 0, 0], [1, 0, 0], [1, 0, 1]] },
+  { dir: [0, 0, 1], shade: 0.85, corners: [[1, 0, 1], [0, 0, 1], [0, 1, 1], [1, 1, 1]] },
+  { dir: [0, 0, -1], shade: 0.85, corners: [[0, 0, 0], [1, 0, 0], [1, 1, 0], [0, 1, 0]] },
+];
 
-  /** local index: (z16 * 16 + x16) * HEIGHT + y */
-  i(x: number, z: number, y: number): number { return (z * CS + x) * HEIGHT + y; }
+// Per-corner AO sign pairs for each face: [face][corner] = [sx, sy].
+const AO_SIGN: number[][][] = [
+  [[-1, -1], [-1, 1], [1, 1], [1, -1]],   // +x: local ax = -z, ay = +y
+  [[1, 1], [1, -1], [-1, -1], [-1, 1]],   // -x: local ax = +z, ay = +y
+  [[-1, -1], [-1, 1], [1, 1], [1, -1]],   // +y: local ax = +x, ay = +z
+  [[-1, -1], [-1, 1], [1, 1], [1, -1]],   // -y: local ax = +x, ay = +z
+  [[-1, -1], [-1, 1], [1, 1], [1, -1]],   // +z: local ax = +x, ay = +y
+  [[1, 1], [1, -1], [-1, -1], [-1, 1]],   // -z: local ax = +x, ay = +y
+];
+
+export interface ChunkMesh {
+  cx: number;
+  cz: number;
+  vertCount: number;
+  dirty: boolean;
 }
 
-export interface FurnaceState {
-  inId: number | null; inN: number;
-  outId: number | null; outN: number;
-  fuelId: number | null; fuelUnits: number; // remaining smelts as float
-  prog: number;                             // seconds into current smelt
-}
-
-export interface WorldSave {
-  seed: string;
-  edits: number[][]; // [x, y, z, id]...
-  furnaces: Record<string, FurnaceState>;
+function lerp3(a: [number, number, number], b: [number, number, number], t: number): [number, number, number] {
+  return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
 }
 
 export class World {
-  seedStr: string;
-  seed: number;
+  private seed: number;
+  private chunks = new Map<string, Uint8Array>(); // "cx,cz" -> CHUNK*CHUNK*96
+  private meshes = new Map<string, ChunkMesh>();
+  private meshCache = new Map<string, Float32Array>();
 
-  chunks = new Map<string, Chunk>();
-  private heightCache = new Map<string, number>();
-
-  /** replayable edits: "x,y,z" -> id (save/restore) */
-  edits = new Map<string, number>();
-  furnaces = new Map<string, FurnaceState>();
-
-  /** chunkKey -> count of light-emitting blocks in that chunk */
-  private emitCnt = new Map<string, number>();
-  /** world positions of emitters ("x,y,z") */
-  private emitters = new Set<string>();
-
-  /** chunkKeys whose mesh must be (re)built — drained by the game each frame */
-  dirty = new Set<string>();
-  /** region centers "cx,cz" whose block-light BFS is queued */
-  private pendingLight = new Set<string>();
-
-  private spawn: { x: number; y: number; z: number; yaw: number } | null = null;
-
-  constructor(seedStr: string) {
-    this.seedStr = seedStr;
-    this.seed = hashSeed(seedStr);
+  constructor(seed: number) {
+    this.seed = seed | 0;
   }
 
-  /* ---------------- terrain (pure functions of the seed) --------------- */
-
-  private heightRaw(x: number, z: number): number {
-    const c = fbm2(x * 0.0016, z * 0.0016, this.seed + 900, 4) * 2 - 1; // continents ~[-1,1]
-    const e = fbm2(x * 0.0075 + 31, z * 0.0075 - 17, this.seed + 411, 4); // hill energy
-    const hill = smoothstep(0.52, 0.96, e);
-    let h = 27 + c * 10;          // ~17..37
-    h += hill * (16 + e * 16);    // ridges up to ~+30
-    return Math.floor(Math.max(2, Math.min(HEIGHT - 6, h)));
+  private key(cx: number, cz: number): string {
+    return cx + ',' + cz;
   }
 
-  /** Highest solid block base y for a column (cached). */
-  heightAt(x: number, z: number): number {
-    const k = x + ',' + z;
-    let v = this.heightCache.get(k);
-    if (v === undefined) {
-      v = this.heightRaw(x, z);
-      this.heightCache.set(k, v);
+  private chunk(cx: number, cz: number): Uint8Array {
+    const k = this.key(cx, cz);
+    let c = this.chunks.get(k);
+    if (!c) {
+      c = new Uint8Array(CHUNK * CHUNK * 96);
+      this.generateChunk(cx, cz, c);
+      this.chunks.set(k, c);
     }
-    return v;
+    return c;
   }
 
-  private treeDensity(x: number, z: number, h: number): number {
-    if (h < SEA + 2) return 0;            // no trees underwater / beach
-    if (h > 48) return 0.05;              // rocky tops are sparse
-    const t = fbm2(x * 0.01 + 517, z * 0.01 - 233, this.seed + 808, 3);
-    const base = t > 0.56 ? 0.24 : 0.07;  // dense forest pockets vs meadow scatter
-    return base * smoothstep(SEA + 1, SEA + 6, h);
-  }
+  private generateChunk(cx: number, cz: number, out: Uint8Array): void {
+    const world = this.seed;
+    for (let lz = 0; lz < CHUNK; lz++) {
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const wx = cx * CHUNK + lx;
+        const wz = cz * CHUNK + lz;
 
-  /** Deterministic tree occupying lattice cell (centres at c*3+1). Pure. */
-  private treeAtCell(ccx: number, ccz: number): { h: number; gy: number } | null {
-    const tx = ccx * 3 + 1, tz = ccz * 3 + 1;
-    const gy = this.heightAt(tx, tz);
-    if (gy < SEA + 2 || gy >= HEIGHT - 8) return null;
-    if (h2(ccx, ccz, this.seed + 777) >= this.treeDensity(tx, tz, gy)) return null;
-    const th = 4 + ((h2(ccx, ccz, this.seed + 31) * 3) | 0); // trunk height 4..6
-    return { h: th, gy };
-  }
+        // Terrain height: base desert floor plus one big mesa layer.
+        const n1 = fbm((wx + world) * 0.012, (wz + world) * 0.012, 4);
+        const n2 = fbm((wx + world) * 0.05, (wz + world) * 0.05, 3);
+        let h = Math.round(26 + n1 * 26 + n2 * 4);
 
-  /* ---------------- chunk generation ----------------------------------- */
+        const mesaMask = valueNoise((wx + world) * 0.016, (wz + world) * 0.016);
+        if (mesaMask > 0.58) {
+          const m = Math.min(1, (mesaMask - 0.58) / 0.2);
+          const top = h + Math.round(14 * m);
+          // Sharpen the flat top: anything below the lip falls back to floor.
+          const rim = valueNoise((wx + world) * 0.06, (wz + world) * 0.06);
+          if (rim > 0.42) h = top;
+        }
 
-  getChunk(cx: number, cz: number): Chunk {
-    const k = chunkKey(cx, cz);
-    let ch = this.chunks.get(k);
-    if (!ch) {
-      ch = new Chunk(cx, cz);
-      this.chunks.set(k, ch);
-      this.genChunk(ch);
-      this.queuePossibleLight(cx, cz);
-    }
-    return ch;
-  }
+        const idx = (lx * CHUNK + lz) * 96;
+        for (let y = 0; y < 96; y++) {
+          let id: number = B.AIR;
+          if (y === 0) {
+            id = B.BEDROCK;
+          } else if (y <= h) {
+            const depth = h - y;
+            if (depth === 0) id = B.SAND;
+            else if (depth <= 2) id = B.SANDSTONE;
+            else {
+              // Terracotta / dark-strata bands, then rock.
+              const band = Math.floor(depth - 3) % 4;
+              if (depth <= 12) id = band < 2 ? B.SANDSTONE : TERRA_BLOCK;
+              else if (depth <= 18) id = band < 2 ? STRATA_BLOCK : TERRA_BLOCK;
+              else id = ROCK_BLOCK;
+            }
+          }
+          out[idx + y] = id;
+        }
 
-  /** Non-creating lookup (used by the mesher / streamer). */
-  chunkAt(cx: number, cz: number): Chunk | undefined {
-    return this.chunks.get(chunkKey(cx, cz));
-  }
-
-  unload(k: string): void {
-    this.chunks.delete(k);
-    this.emitCnt.delete(k);
-    this.dirty.delete(k);
-  }
-
-  private genChunk(ch: Chunk): void {
-    this.emitCnt.set(chunkKey(ch.cx, ch.cz), 0); // nature spawns no emitters
-    for (let lz = 0; lz < CS; lz++) {
-      for (let lx = 0; lx < CS; lx++) {
-        this.genColumn(ch, ch.cx * CS + lx, ch.cz * CS + lz);
-      }
-    }
-    this.stampTrees(ch);
-    for (let lz = 0; lz < CS; lz++) {
-      for (let lx = 0; lx < CS; lx++) this.sunPass(ch, lx, lz);
-    }
-    ch.needsMesh = true;
-  }
-
-  private genColumn(ch: Chunk, wx: number, wz: number): void {
-    const lx = wx - ch.cx * CS;
-    const lz = wz - ch.cz * CS;
-    const h = this.heightAt(wx, wz);
-    const sandy = h <= SEA + 1; // ocean floor / beach rim
-
-    // cliff check: steepest 1-block rise among the 8 neighbours
-    let dh = 0;
-    for (let ax = -1; ax <= 1; ax++) {
-      for (let az = -1; az <= 1; az++) {
-        if (ax === 0 && az === 0) continue;
-        dh = Math.max(dh, Math.abs(h - this.heightAt(wx + ax, wz + az)));
-      }
-    }
-    const cliff = !sandy && dh >= 3;
-
-    for (let y = 0; y <= h; y++) {
-      let id: number;
-      if (y === h)             id = sandy ? B.SAND : cliff ? B.STONE : B.GRASS;
-      else if (y >= h - 3)     id = sandy ? B.SAND : cliff ? B.STONE : B.DIRT;
-      else if (y === 0)        id = B.BEDROCK;
-      else if (y < 4 && h2(wx + y * 31, wz - y * 17, this.seed + 12) > 0.5) id = B.BEDROCK;
-      else {
-        id = B.STONE;
-        if (y < 46 && vnoise3(wx * 0.25, y * 0.34, wz * 0.25, this.seed + 7) > 0.68) id = B.COAL_ORE;
-        else if (y < 30 && vnoise3(wx * 0.22, y * 0.30, wz * 0.22, this.seed + 77) > 0.67) id = B.IRON_ORE;
-      }
-      ch.data[ch.i(lx, lz, y)] = id;
-    }
-
-    // fill water up to sea level
-    for (let y = h + 1; y <= SEA && y < HEIGHT; y++) ch.data[ch.i(lx, lz, y)] = B.WATER;
-
-    // spongy caves: cheap gate first, then real 3D noise where likely
-    for (let y = 3; y <= h; y++) {
-      const b = ch.data[ch.i(lx, lz, y)];
-      if (b !== B.STONE && b !== B.COAL_ORE && b !== B.IRON_ORE) continue;
-      if (h2(wx + y * 37, wz - y * 19, this.seed + 55) < 0.52) continue;
-      const n1 = fbm3(wx * 0.08, y * 0.125, wz * 0.08, this.seed + 31, 3);
-      const n2 = vnoise3(wx * 0.045, y * 0.06, wz * 0.045, this.seed + 91);
-      if (n1 > 0.62 || n2 > 0.74) ch.data[ch.i(lx, lz, y)] = B.AIR;
-    }
-
-    // decorative tall grass on exposed meadow tops
-    const top = ch.data[ch.i(lx, lz, h)];
-    if (top === B.GRASS && h + 1 < HEIGHT && h2(wx, wz, this.seed + 555) < 0.14) {
-      ch.data[ch.i(lx, lz, h + 1)] = B.TALL_GRASS;
-    }
-  }
-
-  /** Stamp every tree whose trunk/leaf volume can intersect this chunk. */
-  private stampTrees(ch: Chunk): void {
-    const x0 = ch.cx * CS, z0 = ch.cz * CS;
-    for (let ccx = Math.floor((x0 - 5) / 3); ccx * 3 + 1 <= x0 + CS + 2; ccx++) {
-      for (let ccz = Math.floor((z0 - 5) / 3); ccz * 3 + 1 <= z0 + CS + 2; ccz++) {
-        const t = this.treeAtCell(ccx, ccz);
-        if (!t) continue;
-        this.stampTree(ch, ccx * 3 + 1, ccz * 3 + 1, t.gy, t.h);
-      }
-    }
-  }
-
-  private stampTree(ch: Chunk, tx: number, tz: number, gy: number, th: number): void {
-    const top = gy + th;
-
-    // leaf blob (AIR-only writes, clipped to this chunk)
-    for (let k = -1; k <= 2; k++) {
-      const ly = top + k;
-      if (ly < 0 || ly >= HEIGHT) continue;
-      const r = k <= 1 ? 2 : 1;
-      for (let ox = -r; ox <= r; ox++) {
-        for (let oz = -r; oz <= r; oz++) {
-          if (Math.abs(ox) === 2 && Math.abs(oz) === 2 && k < 1) continue; // rounded corners
-          const wx = tx + ox, wz = tz + oz;
-          const lx = wx - ch.cx * CS, lz = wz - ch.cz * CS;
-          if (lx < 0 || lx >= CS || lz < 0 || lz >= CS) continue;
-          if (h2(wx + ly * 13, wz - ly * 7, this.seed + 911) < 0.2) continue; // speckled canopy
-          const i = ch.i(lx, lz, ly);
-          if (ch.data[i] === B.AIR) ch.data[i] = B.LEAVES;
+        // Scattered cacti on exposed sand.
+        if (out[idx + h] === B.SAND && hash2(wx * 7 + 13, wz * 5 - world) < 0.006 && h > 4 && h + 3 < 95) {
+          const n = 1 + ((hash2(wx - world, wz + 9) * 3) | 0);
+          for (let i = 1; i <= n; i++) out[idx + h + i] = CACTUS_BLOCK;
         }
       }
     }
 
-    // trunk (centre column, if inside this chunk)
-    const lx = tx - ch.cx * CS;
-    const lz = tz - ch.cz * CS;
-    if (lx < 0 || lx >= CS || lz < 0 || lz >= CS) return;
-    for (let y = gy + 1; y <= top && y < HEIGHT; y++) {
-      const i = ch.i(lx, lz, y);
-      if (ch.data[i] === B.AIR) ch.data[i] = B.LOG;
-    }
-  }
-
-  /* ---------------- lighting ------------------------------------------- */
-
-  /** Sunlight is purely per-column: carry a sky value downward; opaque
-   *  blocks cut it, water attenuates by 2. (Leaves block; glass/crosses pass.) */
-  private sunPass(ch: Chunk, lx: number, lz: number): void {
-    let s = 15;
-    for (let y = HEIGHT - 1; y >= 0; y--) {
-      const i = ch.i(lx, lz, y);
-      ch.sun[i] = s;
-      const b = ch.data[i];
-      if (b === B.WATER) {
-        if (s > 0) s = Math.max(0, s - 2);
-      } else if (b !== B.AIR) {
-        const d = blockDef(b);
-        if (d && d.opaque === 1) s = 0;
-      }
-    }
-  }
-
-  /** BFS block light over the 3x3-chunk region centred on (cx,cz). */
-  private blightBFS(cx: number, cz: number): void {
-    const xMin = (cx - 1) * CS, zMin = (cz - 1) * CS;
-    const span = CS * 3;
-
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        const c = this.chunks.get(chunkKey(cx + dx, cz + dz));
-        if (!c) return; // region incomplete — caller queues us for later
-        c.blt.fill(0);
-      }
-    }
-
-    const qx: number[] = [], qy: number[] = [], qz: number[] = [];
-    for (const pk of this.emitters) {
-      const p = pk.split(',');
-      const ex = +p[0], ey = +p[1], ez = +p[2];
-      if (ex < xMin || ex >= xMin + span || ez < zMin || ez >= zMin + span) continue;
-      const ch = this.chunks.get(chunkKey(Math.floor(ex / CS), Math.floor(ez / CS)))!;
-      const i = ch.i(ex - ch.cx * CS, ez - ch.cz * CS, ey);
-      const d = blockDef(ch.data[i]);
-      let lvl = (d && d.emit > 0) ? d.emit : 0;
-      const f = this.furnaces.get(pk);
-      if (f && f.fuelUnits > 0.5) lvl = Math.max(lvl, 13); // burning furnace glow
-      if (lvl > ch.blt[i]) {
-        ch.blt[i] = lvl;
-        qx.push(ex); qy.push(ey); qz.push(ez);
-      }
-    }
-
-    let head = 0;
-    while (head < qx.length) {
-      const x = qx[head], y = qy[head], z = qz[head]; head++;
-      const chC = this.chunks.get(chunkKey(Math.floor(x / CS), Math.floor(z / CS)))!;
-      const l = chC.blt[chC.i(x - chC.cx * CS, z - chC.cz * CS, y)];
-      const nl = l - 1;
-      if (nl < 1) continue;
-
-      const nb = [
-        [x + 1, y, z], [x - 1, y, z], [x, y + 1, z],
-        [x, y - 1, z], [x, y, z + 1], [x, y, z - 1],
-      ];
-      for (const n of nb) {
-        const nx = n[0], ny = n[1], nz = n[2];
-        if (ny < 0 || ny >= HEIGHT) continue;
-        const chN = this.chunks.get(chunkKey(Math.floor(nx / CS), Math.floor(nz / CS)));
-        if (!chN) continue; // region edge — re-lit once the region is whole
-        const li = chN.i(nx - chN.cx * CS, nz - chN.cz * CS, ny);
-        const b = chN.data[li];
-        if (b !== B.AIR && b !== B.WATER) {
-          const bd = blockDef(b);
-          if (bd && bd.opaque === 1) continue; // solids block light
-        }
-        if (nl > chN.blt[li]) {
-          chN.blt[li] = nl;
-          qx.push(nx); qy.push(ny); qz.push(nz);
+    // Guarantee spawn plateau: a 9x9 flat sand disc at the world origin.
+    if (cx === 0 && cz === 0) {
+      for (let lz = 0; lz < CHUNK; lz++) {
+        for (let lx = 0; lx < CHUNK; lx++) {
+          const dx = lx - 8, dz = lz - 8;
+          if (dx * dx + dz * dz <= 20) {
+            const idx = (lx * CHUNK + lz) * 96;
+            for (let y = 1; y < 40; y++) out[idx + y] = B.AIR;
+            for (let y = 1; y <= 30; y++) out[idx + y] = ROCK_BLOCK;
+            for (let y = 31; y <= 32; y++) out[idx + y] = B.SANDSTONE;
+            out[idx + 33] = B.SAND;
+          }
         }
       }
     }
   }
 
-  private allNine(cx: number, cz: number): boolean {
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        if (!this.chunks.has(chunkKey(cx + dx, cz + dz))) return false;
-      }
-    }
-    return true;
+  getBlock(wx: number, wy: number, wz: number): number {
+    if (wy < 0) return B.BEDROCK;
+    if (wy >= 96) return B.AIR;
+    const cx = Math.floor(wx / CHUNK);
+    const cz = Math.floor(wz / CHUNK);
+    const lx = wx - cx * CHUNK;
+    const lz = wz - cz * CHUNK;
+    return this.chunk(cx, cz)[(lx * CHUNK + lz) * 96 + wy];
   }
 
-  private regionHasEmitters(cx: number, cz: number): boolean {
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        if ((this.emitCnt.get(chunkKey(cx + dx, cz + dz)) || 0) > 0) return true;
-      }
-    }
-    return false;
+  isSolid(wx: number, wy: number, wz: number): boolean {
+    const d = blockDef(this.getBlock(wx | 0, wy | 0, wz | 0));
+    return !!d && d.solid;
   }
 
-  private queuePossibleLight(cx: number, cz: number): void {
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) {
-        const kx = cx + dx, kz = cz + dz;
-        if (this.allNine(kx, kz) && this.regionHasEmitters(kx, kz)) {
-          this.pendingLight.add(chunkKey(kx, kz));
+  setBlock(wx: number, wy: number, wz: number, id: number): void {
+    if (wy < 1 || wy >= 96) return;
+    const cx = Math.floor(wx / CHUNK);
+    const cz = Math.floor(wz / CHUNK);
+    const lx = wx - cx * CHUNK;
+    const lz = wz - cz * CHUNK;
+    this.chunk(cx, cz)[(lx * CHUNK + lz) * 96 + wy] = id;
+    this.markDirty(cx, cz);
+    if (lx === 0) this.markDirty(cx - 1, cz);
+    if (lx === CHUNK - 1) this.markDirty(cx + 1, cz);
+    if (lz === 0) this.markDirty(cx, cz - 1);
+    if (lz === CHUNK - 1) this.markDirty(cx, cz + 1);
+  }
+
+  /** Highest solid block y at (wx, wz), or -1 if none. */
+  surfaceY(wx: number, wz: number): number {
+    for (let y = 95; y >= 0; y--) {
+      if (this.isSolid(wx, y, wz)) return y;
+    }
+    return -1;
+  }
+
+  /** Spawn point: on the guaranteed sand plateau, facing the mesas. */
+  spawn(): { x: number; y: number; z: number } {
+    const y = this.surfaceY(8, 8);
+    return { x: 8.5, y: (y < 0 ? 34 : y) + 1.05, z: 8.5 };
+  }
+
+  /** Ensure chunks around the player are generated + meshed; returns dirty ones. */
+  sync(px: number, pz: number): ChunkMesh[] {
+    const pcx = Math.floor(px / CHUNK);
+    const pcz = Math.floor(pz / CHUNK);
+    const dirty: ChunkMesh[] = [];
+    for (let dz = -VIEW_CHUNKS + 1; dz <= VIEW_CHUNKS - 1; dz++) {
+      for (let dx = -VIEW_CHUNKS + 1; dx <= VIEW_CHUNKS - 1; dx++) {
+        const cx = pcx + dx;
+        const cz = pcz + dz;
+        this.chunk(cx, cz); // generate if missing (also fills neighbours' borders)
+        const k = this.key(cx, cz);
+        let m = this.meshes.get(k);
+        if (!m) {
+          m = { cx, cz, vertCount: 0, dirty: true };
+          this.meshes.set(k, m);
+        }
+        if (m.dirty) {
+          this.meshData(cx, cz); // build + cache the merged vertex array (fillMesh)
+          m.vertCount = Math.floor(this.meshCache.get(k)!.length / 7);
+          dirty.push(m);
         }
       }
     }
-  }
 
-  /** Run any queued block-light BFS whose region is complete. Call each frame. */
-  flushLight(): void {
-    if (this.pendingLight.size === 0) return;
-    for (const k of Array.from(this.pendingLight)) {
-      const p = k.split(',');
-      const cx = +p[0], cz = +p[1];
-      if (this.regionHasEmitters(cx, cz)) {
-        if (this.allNine(cx, cz)) {
-          this.blightBFS(cx, cz);
-          this.pendingLight.delete(k);
-        }
-      } else {
-        this.pendingLight.delete(k); // nothing to do; future edits trigger directly
+    // Drop far chunks to keep memory bounded.
+    for (const [k, m] of this.meshes) {
+      if (Math.abs(m.cx - pcx) > VIEW_CHUNKS + 1 || Math.abs(m.cz - pcz) > VIEW_CHUNKS + 1) {
+        this.meshes.delete(k);
       }
     }
+    return dirty;
   }
 
-  /* ---------------- block access / mutation ---------------------------- */
-
-  /** Read a block; auto-generates the chunk (player-facing calls). */
-  block(x: number, y: number, z: number): number {
-    if (y < 0) return B.BEDROCK;
-    if (y >= HEIGHT) return B.AIR;
-    const ch = this.getChunk(Math.floor(x / CS), Math.floor(z / CS));
-    return ch.data[ch.i(x - ch.cx * CS, z - ch.cz * CS, y)];
-  }
-
-  /** Read a block without generating (mesher AO / light sampling). */
-  peek(x: number, y: number, z: number): number {
-    if (y < 0) return B.BEDROCK;
-    if (y >= HEIGHT) return B.AIR;
-    const ch = this.chunkAt(Math.floor(x / CS), Math.floor(z / CS));
-    if (!ch) return B.AIR;
-    return ch.data[ch.i(x - ch.cx * CS, z - ch.cz * CS, y)];
-  }
-
-  /**
-   * Place/remove a block. Refreshes column sunlight, marks nearby meshes
-   * dirty, drops unsupported cross-blocks above, and re-lights the 3x3
-   * region (or queues it) when emitters are involved. `quiet` skips the
-   * immediate BFS — used while replaying saved edits, then flushLight.
-   */
-  setBlock(x: number, y: number, z: number, id: number, quiet = false): void {
-    if (y < 0 || y >= HEIGHT) return;
-    const cx = Math.floor(x / CS), cz = Math.floor(z / CS);
-    const ch = this.getChunk(cx, cz);
-    const lx = x - cx * CS, lz = z - cz * CS;
-    const i = ch.i(lx, lz, y);
-    const old = ch.data[i];
-    if (old === id) return;
-    ch.data[i] = id;
-
-    this.edits.set(posKey(x, y, z), id);
-
-    // unsupported cross-blocks fall
-    if (id === B.AIR && y + 1 < HEIGHT) {
-      const above = ch.data[i + 1];
-      if (above === B.TORCH || above === B.TALL_GRASS) {
-        ch.data[i + 1] = B.AIR;
-        this.edits.set(posKey(x, y + 1, z), B.AIR);
-      }
-    }
-
-    // furnace contents die with the block (game collects the drops)
-    if (old === B.FURNACE && id !== B.FURNACE) this.furnaces.delete(posKey(x, y, z));
-
-    // emitter bookkeeping
-    const wasE = old === B.TORCH || old === B.FURNACE;
-    const isE = id === B.TORCH || id === B.FURNACE;
-    if (wasE !== isE) {
-      const ck = chunkKey(cx, cz);
-      this.emitCnt.set(ck, Math.max(0, (this.emitCnt.get(ck) || 0) + (isE ? 1 : -1)));
-      const pk = posKey(x, y, z);
-      if (isE) this.emitters.add(pk); else this.emitters.delete(pk);
-    }
-
-    // sunlight for the changed column (cheap, always correct)
-    this.sunPass(ch, lx, lz);
-
-    // dirty the chunk and any that share a border with it
-    for (let dx = -1; dx <= 1; dx++) {
-      for (let dz = -1; dz <= 1; dz++) this.dirty.add(chunkKey(cx + dx, cz + dz));
-    }
-
-    if (!quiet && this.regionHasEmitters(cx, cz)) {
-      if (this.allNine(cx, cz)) this.blightBFS(cx, cz);
-      else this.pendingLight.add(chunkKey(cx, cz));
+  private markDirty(cx: number, cz: number): void {
+    const m = this.meshes.get(this.key(cx, cz));
+    if (m) {
+      m.dirty = true;
+      this.meshCache.delete(this.key(cx, cz));
     }
   }
 
-  /* ---------------- furnaces ------------------------------------------- */
-
-  furnaceAt(x: number, y: number, z: number): FurnaceState {
-    const k = posKey(x, y, z);
-    let f = this.furnaces.get(k);
-    if (!f) {
-      f = { inId: null, inN: 0, outId: null, outN: 0, fuelId: null, fuelUnits: 0, prog: 0 };
-      this.furnaces.set(k, f);
+  /** Raw interleaved vertex array for a chunk (x,y,z, nx,ny,nz, r,g,b). */
+  meshData(cx: number, cz: number): Float32Array {
+    const k = this.key(cx, cz);
+    let arr = this.meshCache.get(k);
+    if (!arr) {
+      const out: number[] = [];
+      this.fillMesh(cx, cz, out);
+      arr = new Float32Array(out);
+      this.meshCache.set(k, arr);
     }
-    return f;
+    return arr;
   }
 
-  furnaceLit(x: number, y: number, z: number): boolean {
-    const f = this.furnaces.get(posKey(x, y, z));
-    return !!f && f.fuelUnits > 0.5;
-  }
+  private fillMesh(cx: number, cz: number, out: number[]): void {
+    for (let lz = 0; lz < CHUNK; lz++) {
+      for (let lx = 0; lx < CHUNK; lx++) {
+        const wx = cx * CHUNK + lx;
+        const wz = cz * CHUNK + lz;
+        for (let y = 1; y < 95; y++) {
+          const id = this.getBlock(wx, y, wz);
+          if (id === B.AIR) continue;
+          const col = blockColor(id);
 
-  /* ---------------- spawn search --------------------------------------- */
+          for (let f = 0; f < FACES.length; f++) {
+            const face = FACES[f];
+            if (this.isOpaque(wx + face.dir[0], y + face.dir[1], wz + face.dir[2])) continue;
+            const ao = this.faceAO(wx, y, wz, f);
 
-  /**
-   * Find a grassy hill near the origin that overlooks water with forest in
-   * view — "spawn on a hill at golden hour". Pure: no chunks required.
-   */
-  findSpawn(): { x: number; y: number; z: number; yaw: number } {
-    if (this.spawn) return this.spawn;
+            // Aerial perspective: fade toward the sky horizon with distance.
+            const dist = Math.hypot(wx - 8, wz - 8) + Math.abs(y - 30);
+            const t = Math.min(1, Math.max(0, (dist - FOG_START) / (FOG_END - FOG_START)));
+            const fog = lerp3(col, SKY_HORIZON, t * 0.5);
+            const s = face.shade;
 
-    const dirs: Array<[number, number]> = [
-      [1, 0], [-1, 0], [0, 1], [0, -1],
-      [0.7, 0.7], [0.7, -0.7], [-0.7, 0.7], [-0.7, -0.7],
-    ];
-
-    let bx = 0, bz = 0, bh = this.heightAt(0, 0);
-    let fx = 0, fz = -1;
-    let best = -Infinity;
-
-    for (let x = -48; x <= 48; x += 2) {
-      for (let z = -48; z <= 48; z += 2) {
-        const h = this.heightAt(x, z);
-        if (h < SEA + 3 || h > SEA + 15) continue; // want a hill, not a cliff
-
-        let water = 0;
-        let wdx = 0, wdz = -1, wd = 99;
-        for (const d of dirs) {
-          for (let t = 6; t <= 24; t += 3) {
-            const nx = x + Math.round(d[0] * t);
-            const nz = z + Math.round(d[1] * t);
-            if (this.heightAt(nx, nz) < SEA) { // that column is underwater → water visible
-              const w = 1 - t / 30;
-              if (w > water) { water = w; wdx = d[0]; wdz = d[1]; wd = t; }
-              break;
+            for (let i = 0; i < 4; i++) {
+              const cn = face.corners[i];
+              out.push(
+                wx + cn[0], y + cn[1], wz + cn[2],
+                face.dir[0], face.dir[1], face.dir[2],
+                (fog[0] / 255) * s * ao[i],
+                (fog[1] / 255) * s * ao[i],
+                (fog[2] / 255) * s * ao[i],
+              );
             }
           }
         }
-
-        let forest = 0;
-        const pcx = Math.floor((x - 1) / 3), pcz = Math.floor((z - 1) / 3);
-        for (let a = -2; a <= 2; a++) {
-          for (let b = -2; b <= 2; b++) {
-            if (this.treeAtCell(pcx + a, pcz + b)) forest++;
-          }
-        }
-
-        const score = water * 3 + forest * 0.15 - (Math.abs(x) + Math.abs(z)) * 0.004;
-        if (score > best) {
-          best = score; bx = x; bz = z; bh = h;
-          fx = wdx / (wd > 0 ? Math.hypot(wdx, wdz) || 1 : 1);
-          fz = wdz / (wd > 0 ? Math.hypot(wdx, wdz) || 1 : 1);
-        }
       }
     }
-
-    if (best < 0) {
-      // fallback: nearest decent grassy spot outward from origin
-      outer: for (let r = 2; r <= 64; r += 2) {
-        for (let a = -r; a <= r; a += 4) {
-          const xs: number[] = [a, -a], zs: number[] = [a, -a];
-          for (const sx of xs) for (const sz of zs) {
-            const h = this.heightAt(sx, sz);
-            if (h >= SEA + 3 && h <= SEA + 15) { bx = sx; bz = sz; bh = h; break outer; }
-          }
-        }
-      }
-    }
-
-    // face the water: forward=(-sin yaw, -cos yaw) horizontally → yaw = atan2(-dx, -dz)
-    const yaw = Math.atan2(-fx, -fz);
-    this.spawn = { x: bx + 0.5, y: bh + 1, z: bz + 0.5, yaw };
-    return this.spawn;
   }
 
-  /* ---------------- save / restore -------------------------------------- */
-
-  serialize(): WorldSave {
-    const edits: number[][] = [];
-    this.edits.forEach((id, k) => {
-      const p = k.split(',');
-      edits.push([+p[0], +p[1], +p[2], id]);
-    });
-    return { seed: this.seedStr, edits, furnaces: Object.fromEntries(this.furnaces) };
+  private isOpaque(wx: number, wy: number, wz: number): boolean {
+    const d = blockDef(this.getBlock(wx, wy, wz));
+    return !!d && (d.opaque === 1 || d.id === B.LEAVES);
   }
 
-  /** Replay saved edits quietly, then queue the affected light regions. */
-  applyRestored(edits: number[][], furnaces: Record<string, FurnaceState>): void {
-    for (const e of edits) this.setBlock(e[0], e[1], e[2], e[3], true);
-    for (const [k, f] of Object.entries(furnaces)) this.furnaces.set(k, f);
-    const centers = new Set<string>();
-    for (const e of edits) {
-      const cx = Math.floor(e[0] / CS), cz = Math.floor(e[2] / CS);
-      for (let dx = -1; dx <= 1; dx++) for (let dz = -1; dz <= 1; dz++) {
-        centers.add(chunkKey(cx + dx, cz + dz));
-      }
+  /** Per-corner AO for a visible face (4 values, matches FACES corner order). */
+  private faceAO(wx: number, y: number, wz: number, f: number): [number, number, number, number] {
+    const face = FACES[f];
+    // In-plane axes for this face (both perpendicular to the face normal).
+    let ax: [number, number, number], ay: [number, number, number];
+    if (f === 0 || f === 1) { ax = [0, 1, 0]; ay = [0, 0, 1]; }
+    else if (f === 2 || f === 3) { ax = [1, 0, 0]; ay = [0, 0, 1]; }
+    else { ax = [1, 0, 0]; ay = [0, 1, 0]; }
+
+    const occ = (x: number, yy: number, z: number): boolean => this.isOpaque(x, yy, z);
+    const base: [number, number, number] = [wx + face.dir[0], y + face.dir[1], wz + face.dir[2]];
+    const out: [number, number, number, number] = [1, 1, 1, 1];
+    const signs = AO_SIGN[f]; // per-corner sign pairs for this face
+    for (let i = 0; i < 4; i++) {
+      const sAx = signs[i][0]; // this corner's two in-plane neighbour signs
+      const sAz = signs[i][1];
+      // Two in-plane neighbour cells around this corner.
+      const n1 = occ(base[0] + sAx * ax[0], base[1] + sAz * ay[1], base[2] + sAx * ax[2]);
+      const n2 = occ(base[0] + sAz * ay[0], base[1] + sAx * ax[1] + sAz * ay[1], base[2] + sAz * ay[2]);
+      const edge = occ(base[0] + sAx * ax[0] + sAz * ay[0],
+        base[1] + sAx * ax[1] + sAz * ay[1],
+        base[2] + sAx * ax[2] + sAz * ay[2]);
+      if (n1 && n2) out[i] = 0.5;   // enclosed
+      else if (n1 || n2) out[i] = 0.7; // one neighbour
+      else if (edge) out[i] = 0.85;    // edge only
     }
-    for (const k of centers) this.pendingLight.add(k);
+    return out;
+  }
+}
+
+// Extra block ids rendered as palette colours (not in the placeable registry).
+const TERRA_BLOCK = 100; // terracotta band
+const STRATA_BLOCK = 101; // dark strata band
+const ROCK_BLOCK = 102;   // rock
+const CACTUS_BLOCK = 103; // cactus
+
+function blockColor(id: number): [number, number, number] {
+  switch (id) {
+    case B.SAND: return SAND;
+    case B.SANDSTONE: return SANDSTONE;
+    case TERRA_BLOCK: return TERRA;
+    case STRATA_BLOCK: return STRATA;
+    case ROCK_BLOCK: return ROCK;
+    case CACTUS_BLOCK: return CACTUS;
+    default: return [200, 180, 150];
   }
 }

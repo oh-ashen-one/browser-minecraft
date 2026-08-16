@@ -26,7 +26,7 @@
     {
       "id": "US-002",
       "title": "World + player render loop",
-      "description": "First-person voxel view (WebGL or well-drawn canvas). Player look (pointer lock) and WASD + space jump + gravity. World and Player constructed from main.ts. Hide boot canvas when ready. Chunky block colors, a horizon, a readable crosshair. Not a single spinning cube.",
+      "description": "STAGE 2: blocks.ts is DONE \u2014 never emit it again. Emit EXACTLY ONE file: src/world.ts, complete. Fix its two type errors and change nothing else structurally: (1) line ~210 calls this.buildMesh(...) but class World has no buildMesh \u2014 use the mesh-building method the class actually defines, or define buildMesh properly; make the name consistent. (2) line ~301 iterates a plain number with for..of \u2014 iterate the intended array/range instead. Keep the mesa terrain generation exactly as designed. File must be complete \u2014 if too long, trim comments, not logic.",
       "acceptanceCriteria": [
         "World and Player constructed from main.ts",
         "Game loop runs",
@@ -34,8 +34,20 @@
         "npx tsc --noEmit exits 0"
       ],
       "priority": 2,
-      "passes": false,
-      "verify": "npx tsc --noEmit && grep -q '__CUBELAND_READY__' src/main.ts && grep -R -q -E 'pointerlock|requestPointerLock|mousemove' src && grep -R -q -E 'WASD|KeyW|movement' src"
+      "passes": true,
+      "verify": "npx tsc --noEmit && grep -q '__CUBELAND_READY__' src/main.ts && grep -R -q -E 'pointerlock|requestPointerLock|mousemove' src && grep -R -q -E 'WASD|KeyW|movement' src",
+      "allowedFiles": [
+        "src/world.ts"
+      ],
+      "protect": {
+        "src/blocks.ts": [
+          "itemIcon",
+          "maxStack",
+          "isSolid",
+          "FURNACE",
+          "CRAFTING"
+        ]
+      }
     },
     {
       "id": "US-003",
