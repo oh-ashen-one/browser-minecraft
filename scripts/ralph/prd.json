@@ -114,7 +114,7 @@
         "At least 5 source files under src/"
       ],
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "verify": "npx tsc --noEmit && test $(find src -name '*.ts' | wc -l) -ge 5 && grep -R -q -E 'pause|Escape|title|CUBELAND' src index.html && grep -q '__CUBELAND_READY__' src/main.ts"
     }
   ]

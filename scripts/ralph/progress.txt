@@ -241,3 +241,9 @@ Started: Sat Aug 15 18:32:35 EDT 2026
 - files: src/mob.ts
 - checks FAILED — next iteration must fix LAST_VERIFY.txt
 ---
+
+## 2026-08-16 10:41 UTC - US-005
+- verify_ok: True
+- files: src/mob.ts
+- checks passed
+---
