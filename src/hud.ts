@@ -35,6 +35,7 @@ const CSS = `
 #duskHud .hearts{position:absolute;left:16px;bottom:78px;display:flex}
 #duskHud .hearts canvas{width:20px;height:18px;image-rendering:pixelated;margin-right:3px}
 #duskHud .clock{position:absolute;left:16px;bottom:104px;color:#F0C060;font-style:italic;font-weight:700;font-size:14px;text-shadow:-1px -1px 0 #241535,1px -1px 0 #241535,-1px 1px 0 #241535,1px 1px 0 #241535}
+#duskHud .clock small{color:#3FE0C5;font-style:normal;font-weight:400;letter-spacing:.3em;text-transform:uppercase;font-size:9px;margin-right:8px}
 #duskHud .hint{position:absolute;top:10px;right:12px;color:#3FE0C5;font-size:10px;letter-spacing:.4em;text-transform:uppercase;text-shadow:0 1px 2px rgba(0,0,0,.8)}
 #duskHud .hint b{color:#F5E3C0;font-weight:700;letter-spacing:.1em}
 #duskHud .hotbar{position:absolute;left:50%;bottom:14px;transform:translateX(-50%) skewX(-3deg);display:flex;gap:4px}
@@ -49,6 +50,7 @@ export interface Hud {
   select(i: number): void;
   setSlots(slots: SlotView[]): void;
   toast(msg: string, ms?: number): void;
+  setTime(minutes: number, isNight: boolean): void;
 }
 
 export function makeHud(iconFn?: IconFn): Hud {
@@ -106,6 +108,7 @@ export function makeHud(iconFn?: IconFn): Hud {
 
   let sel = 0;
   let toastTimer: number | null = null;
+  let lastClockKey = '';
 
   function select(i: number): void {
     sel = Math.max(0, Math.min(8, i));
@@ -132,9 +135,21 @@ export function makeHud(iconFn?: IconFn): Hud {
     toastTimer = msg ? window.setTimeout(() => { toastEl.style.opacity = '0'; toastTimer = null; }, ms) : null;
   }
 
+  /** Time-of-day clock (US-005). minutes = 0..1439. */
+  function setTime(minutes: number, isNight: boolean): void {
+    const hh = Math.floor(minutes / 60) % 24;
+    const mm = minutes % 60;
+    const key = hh + ':' + mm + (isNight ? 'N' : 'D');
+    if (key === lastClockKey) return; // avoid DOM churn every frame
+    lastClockKey = key;
+    const h2 = String(hh).padStart(2, '0');
+    const m2 = String(mm).padStart(2, '0');
+    clock.innerHTML = '<small>' + (isNight ? 'NIGHT' : 'DAY') + '</small>' + h2 + ':' + m2;
+  }
+
   document.body.appendChild(root);
   injectInvCss();
-  return { select, setSlots, toast };
+  return { select, setSlots, toast, setTime };
 }
 
 export interface InvUi {

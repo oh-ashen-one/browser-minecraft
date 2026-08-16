@@ -223,3 +223,21 @@ Started: Sat Aug 15 18:32:35 EDT 2026
 - files: src/inv.ts
 - checks FAILED — next iteration must fix LAST_VERIFY.txt
 ---
+
+## 2026-08-16 10:17 UTC - US-004
+- verify_ok: True
+- files: src/hud.ts, src/main.ts
+- checks passed
+---
+
+## 2026-08-16 10:34 UTC - US-005
+- verify_ok: False
+- files: src/mob.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
+
+## 2026-08-16 10:37 UTC - US-005
+- verify_ok: False
+- files: src/mob.ts
+- checks FAILED — next iteration must fix LAST_VERIFY.txt
+---
