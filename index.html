@@ -1,0 +1,307 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>CUBELAND</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='8' fill='%237cbd5a'/%3E%3Crect y='8' width='16' height='8' fill='%237a5434'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg-dark: #101418;
+    --panel: #c6c6c6;
+    --panel-dark: #8b8b8b;
+    --slot-bg: #8b8b8b;
+    --slot-inset: #373737;
+    --accent: #5fae3d;
+    --text-dark: #1c1c1c;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  html, body { width: 100%; height: 100%; overflow: hidden; background: #000; }
+  body {
+    font-family: ui-monospace, "Cascadia Mono", Menlo, Consolas, monospace;
+    user-select: none; -webkit-user-select: none;
+  }
+  .hidden { display: none !important; }
+
+  #gl, #bootCv {
+    position: fixed; inset: 0; width: 100%; height: 100%; display: block;
+    image-rendering: pixelated;
+  }
+  #bootCv { z-index: 60; }
+  body.playing #gl { cursor: none; }
+
+  /* ---------- damage vignette / toasts ---------- */
+  #hurt {
+    position: fixed; inset: 0; z-index: 30; pointer-events: none; opacity: 0;
+    background: radial-gradient(ellipse at center, rgba(255,0,0,0) 40%, rgba(180,10,10,.55) 100%);
+    transition: opacity .25s;
+  }
+  #toast {
+    position: fixed; left: 50%; bottom: 118px; transform: translateX(-50%);
+    z-index: 40; pointer-events: none; opacity: 0; transition: opacity .3s;
+    background: rgba(12,14,16,.85); color: #fff; border: 1px solid rgba(255,255,255,.2);
+    padding: 6px 14px; font-size: 13px; letter-spacing: .04em;
+  }
+
+  /* ---------- overlays / panels ---------- */
+  .overlay { position: fixed; inset: 0; display: flex; align-items: center; justify-content: center; z-index: 50; }
+  .panel {
+    background: var(--panel); color: var(--text-dark);
+    border: 3px solid; border-color: #f0f0f0 var(--panel-dark) var(--panel-dark) #f0f0f0;
+    box-shadow: 0 14px 40px rgba(0,0,0,.55);
+    padding: 22px 26px; min-width: 340px; max-width: 560px;
+  }
+
+  /* ---------- main menu ---------- */
+  #menu { z-index: 55; background: linear-gradient(180deg, #26375c 0%, #6d4f6d 40%, #cf8247 65%, #e9b45c 100%); }
+  .menu-wrap { display: flex; flex-direction: column; align-items: center; gap: 18px; }
+  .game-title {
+    font-size: 64px; letter-spacing: .12em; color: #7cbd5a;
+    text-shadow: 0 3px 0 #2f4a22, 0 6px 0 rgba(0,0,0,.35), 0 10px 24px rgba(0,0,0,.5);
+  }
+  .tagline { color: #f4e3bb; letter-spacing: .28em; font-size: 12px; text-transform: uppercase; text-shadow: 0 2px 4px rgba(0,0,0,.6); }
+  #menu .panel { background: rgba(18,22,26,.92); color: #dfe4ea; border-color: rgba(255,255,255,.18) #060a0d #060a0d rgba(255,255,255,.18); }
+  #menu .panel label { display: block; font-size: 11px; letter-spacing: .18em; text-transform: uppercase; color: #9aa4ad; margin-bottom: 6px; }
+  #seedIn {
+    width: 100%; background: #0c1013; color: #fff; border: 2px solid #2c343b;
+    font-family: inherit; font-size: 15px; padding: 8px 10px; margin-bottom: 14px; outline: none;
+  }
+  #seedIn:focus { border-color: var(--accent); }
+  .btn {
+    display: block; width: 100%; font-family: inherit; font-size: 15px; letter-spacing: .08em;
+    color: #fff; background: var(--accent); border: 3px solid;
+    border-color: #8fd96f #357021 #357021 #8fd96f; padding: 10px 14px; cursor: pointer; margin-top: 8px;
+    text-shadow: 0 -1px 0 rgba(0,0,0,.4);
+  }
+  .btn:hover { filter: brightness(1.12); }
+  .btn.sub { background: #3d4852; border-color: #6b7a87 #1e252b #1e252b #6b7a87; }
+  .btn.sub:hover { filter: brightness(1.2); }
+  #saveInfo { margin-top: 10px; font-size: 11px; color: #8fa3b5; letter-spacing: .04em; text-align: center; }
+  .controls-list { list-style: none; display: grid; grid-template-columns: 1fr 1fr; gap: 3px 26px; font-size: 12px; color: #c9d4dd; }
+  .controls-list b { color: #7cbd5a; display: inline-block; min-width: 64px; font-weight: normal; }
+  #muteNote { margin-top: 10px; font-size: 11px; color: #b7c6d4; text-align: center; }
+
+  /* ---------- HUD ---------- */
+  #crosshair { position: fixed; left: 50%; top: 50%; width: 18px; height: 18px; transform: translate(-50%,-50%); z-index: 20; pointer-events: none; mix-blend-mode: difference; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute; background: rgba(255,255,255,.9); }
+  #crosshair::before { left: 8px; top: 0; width: 2px; height: 18px; }
+  #crosshair::after { top: 8px; left: 0; width: 18px; height: 2px; }
+
+  #debug {
+    position: fixed; top: 8px; left: 8px; z-index: 25; pointer-events: none;
+    color: #fff; font-size: 12px; line-height: 1.5; text-shadow: 0 1px 2px rgba(0,0,0,.9);
+    white-space: pre; font-family: inherit;
+  }
+
+  #hotbar { position: fixed; left: 50%; bottom: 14px; transform: translateX(-50%); display: flex; z-index: 20; gap: 3px;
+    background: rgba(10,12,14,.45); padding: 4px; border-radius: 4px; }
+
+  /* ---------- slots (shared HUD / inventory) ---------- */
+  .slot { position: relative; width: 48px; height: 48px; background: var(--slot-bg); cursor: pointer;
+    border: 3px solid; border-color: var(--slot-inset) #fff #fff var(--slot-inset); }
+  .slot .icon { position: absolute; left: 50%; top: 50%; transform: translate(-50%,-52%); width: 34px; height: 34px; image-rendering: pixelated; pointer-events: none; }
+  .slot .count { position: absolute; right: 3px; bottom: 1px; color: #fff; font-size: 14px; text-shadow: -1px -1px 0 #3f3f3f, 1px -1px 0 #3f3f3f, -1px 1px 0 #3f3f3f, 1px 1px 0 #3f3f3f; pointer-events: none; }
+  .slot:hover { filter: brightness(1.15); }
+  .slot.sel { border-color: #fff; outline: 2px solid #fff; }
+  .slot .lbl { position: absolute; left: -3px; top: -18px; font-size: 10px; color: #cfd6dd; text-shadow: 0 1px 2px rgba(0,0,0,.8); pointer-events: none; }
+  #invPanel .slot { width: 46px; height: 46px; }
+  #invPanel .slot .icon { width: 32px; height: 32px; }
+
+  /* ---------- inventory panel ---------- */
+  #invPanel { z-index: 45; background: rgba(0,0,0,.35); }
+  .inv-panel { display: flex; flex-direction: column; gap: 12px; }
+  .inv-panel h2 { font-size: 14px; letter-spacing: .2em; text-transform: uppercase; color: #3a3a3a; }
+  .craft-wrap { display: flex; align-items: center; gap: 14px; }
+  #cgrid { display: grid; grid-template-columns: repeat(3, 46px); gap: 2px; }
+  #cout { width: 52px !important; height: 52px !important; }
+  .craft-arrow { font-size: 20px; color: #4a4a4a; }
+  .slot.off { visibility: hidden; pointer-events: none; }
+  #mainInv { display: grid; grid-template-columns: repeat(9, 46px); gap: 2px; }
+  .inv-hint { font-size: 10px; color: #6d6d6d; letter-spacing: .05em; }
+
+  /* ---------- furnace panel ---------- */
+  #furnPanel { z-index: 45; background: rgba(0,0,0,.35); }
+  .furn-row { display: flex; align-items: center; gap: 18px; }
+  .fuel-col { display: flex; flex-direction: column; align-items: center; gap: 6px; }
+  #fflame { width: 20px; height: 24px; background: transparent; }
+  #fflame.on { background: linear-gradient(#ffe27a, #ff8c1a 55%, #d94e0f); box-shadow: 0 0 18px rgba(255,140,30,.9); clip-path: polygon(50% 0, 100% 40%, 78% 75%, 50% 100%, 22% 75%, 0 40%); }
+  #fbar { width: 26px; height: 80px; background: #5a5a5a; border: 2px solid var(--slot-inset); display: flex; align-items: flex-end; }
+  #fbar .fill { width: 100%; height: 0%; background: linear-gradient(#ffd23e, #ff7a1a); }
+
+  /* ---------- pause / death ---------- */
+  #pauseOv, #deathOv { background: rgba(5,8,10,.6); backdrop-filter: blur(2px); }
+  #deathOv { background: rgba(40,5,5,.72); }
+  #deathOv h2 { color: #ffb0a6; font-size: 34px; letter-spacing: .1em; margin-bottom: 8px; }
+  #deathMsg { color: #e6d3cf; font-size: 14px; margin-bottom: 14px; }
+  #pauseSeed { margin-top: 12px; font-size: 11px; color: #7d8a94; }
+</style>
+</head>
+<body>
+
+<canvas id="gl"></canvas>
+<div id="hurt"></div>
+<div id="toast"></div>
+
+<!-- ============ MAIN MENU ============ -->
+<section id="menu" class="overlay">
+  <div class="menu-wrap">
+    <h1 class="game-title">CUBELAND</h1>
+    <p class="tagline">mine &middot; craft &middot; survive the night</p>
+    <div class="panel" style="width:400px">
+      <label for="seedIn">World seed &mdash; leave blank for random</label>
+      <input id="seedIn" type="text" maxlength="16" placeholder="e.g. GOLDENHILL" spellcheck="false" />
+      <button id="btnNew" class="btn">New World</button>
+      <button id="btnCont" class="btn sub">Continue</button>
+      <div id="saveInfo"></div>
+    </div>
+    <ul class="controls-list">
+      <li><b>WASD</b> move</li><li><b>Mouse</b> look / click to lock</li>
+      <li><b>LMB hold</b> mine (crack + hardness)</li><li><b>RMB</b> place / use block</li>
+      <li><b>Space</b> jump / swim up</li><li><b>Shift</b> sneak</li>
+      <li><b>Sprint</b> double-tap W or Ctrl</li><li><b>E</b> inventory / craft</li>
+      <li><b>1&ndash;9 / wheel</b> hotbar</li><li><b>F3</b> debug overlay (seed, xyz, fps)</li>
+      <li><b>M</b> mute</li><li><b>Q</b> drop held stack (in inventory)</li>
+    </ul>
+    <p id="muteNote">sound: on &middot; press M to mute</p>
+  </div>
+</section>
+
+<!-- ============ HUD ============ -->
+<section id="hud" class="hidden">
+  <div id="crosshair"></div>
+  <pre id="debug"></pre>
+  <div id="hotbar"></div>
+</section>
+
+<!-- ============ INVENTORY / CRAFTING ============ -->
+<section id="invPanel" class="overlay hidden">
+  <div class="panel inv-panel" style="min-width:430px">
+    <h2 id="invTitle">Inventory</h2>
+    <div class="craft-wrap">
+      <div id="cgrid"></div>
+      <span class="craft-arrow">&#10142;</span>
+      <div id="cout" class="slot"></div>
+    </div>
+    <div id="mainInv"></div>
+    <p class="inv-hint">left-click: take / put &middot; right-click: place one / grab half &middot; Q drop &middot; Esc close</p>
+  </div>
+</section>
+
+<!-- ============ FURNACE ============ -->
+<section id="furnPanel" class="overlay hidden">
+  <div class="panel inv-panel" style="min-width:360px">
+    <h2>Furnace</h2>
+    <div class="furn-row">
+      <div id="fin" class="slot"></div>
+      <div class="fuel-col">
+        <div id="fflame"></div>
+        <div id="fbar"><div class="fill"></div></div>
+      </div>
+      <div id="fout" class="slot"></div>
+    </div>
+    <p class="inv-hint">smelts iron ore&rarr;ingot &middot; cobble&rarr;stone &middot; sand&rarr;glass &middot; meat&rarr;cooked (fuel: coal, planks)</p>
+  </div>
+</section>
+
+<!-- ============ PAUSE / DEATH ============ -->
+<section id="pauseOv" class="overlay hidden">
+  <div class="panel" style="text-align:center; min-width:380px">
+    <h2 style="font-size:26px; letter-spacing:.15em">PAUSED</h2>
+    <button id="btnResume" class="btn">Back to CUBELAND</button>
+    <button id="btnSaveMenu" class="btn sub">Save &amp; Main Menu</button>
+    <p id="pauseSeed"></p>
+  </div>
+</section>
+
+<section id="deathOv" class="overlay hidden">
+  <div class="panel" style="text-align:center; min-width:400px">
+    <h2>You died</h2>
+    <p id="deathMsg"></p>
+    <button id="btnRespawn" class="btn">Respawn</button>
+  </div>
+</section>
+
+<div id="ghost" class="hidden"></div>
+
+<!-- Boot screen: animates until the engine sets window.__CUBELAND_READY__ and removes it -->
+<canvas id="bootCv"></canvas>
+<script type="module">
+(function () {
+  const cv = document.getElementById('bootCv');
+  if (!cv) return;
+  const ctx = cv.getContext('2d');
+  let W = 0, H = 0;
+  function resize() { W = cv.width = innerWidth; H = cv.height = innerHeight; }
+  addEventListener('resize', resize); resize();
+
+  function h(n) { const s = Math.sin(n * 127.1 + 311.7) * 43758.5453; return s - Math.floor(s); }
+  const hills = [];
+  for (let i = 0; i < 64; i++) hills.push(0.5 + h(i) * 0.5);
+
+  function frame(tms) {
+    if (window.__CUBELAND_READY__) return; // engine owns the screen now
+    const t = tms * 0.001;
+    // golden hour sky
+    const g = ctx.createLinearGradient(0, 0, 0, H);
+    g.addColorStop(0, '#31456f'); g.addColorStop(0.42, '#8a6a7e');
+    g.addColorStop(0.66, '#d98a4f'); g.addColorStop(1, '#f2c14e');
+    ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+    // sun low over the water
+    const sx = W * 0.68, sy = H * 0.74;
+    const rg = ctx.createRadialGradient(sx, sy, 6, sx, sy, W * 0.22);
+    rg.addColorStop(0, 'rgba(255,244,214,.98)'); rg.addColorStop(0.12, 'rgba(255,214,130,.85)');
+    rg.addColorStop(1, 'rgba(255,200,90,0)');
+    ctx.fillStyle = rg; ctx.fillRect(0, 0, W, H);
+
+    // drifting clouds
+    for (let i = 0; i < 6; i++) {
+      const cx = ((h(i + 40) * W * 1.6 + t * (6 + i)) % (W * 1.2)) - W * 0.1;
+      const cy = H * (0.12 + h(i + 9) * 0.3);
+      ctx.fillStyle = 'rgba(255,236,205,' + (0.14 + 0.1 * h(i)) + ')';
+      ctx.fillRect(cx, cy, 120 + h(i + 3) * 160, 14 + h(i + 5) * 8);
+      ctx.fillRect(cx + 30, cy - 12, 70 + h(i + 6) * 80, 12);
+    }
+
+    // voxel hill silhouette (stepped cubes) on the left
+    const bh = H * 0.34, bw = W / 26;
+    for (let i = 0; i < 14; i++) {
+      const hh = Math.round(hills[i] * bh / 14) * (bh / 14);
+      const x = i * bw - bw;
+      ctx.fillStyle = '#51402c';
+      for (let y = H - hh; y < H; y += 14) ctx.fillRect(x, y, bw + 1, Math.min(14, H - y));
+      ctx.fillStyle = '#3f5a2d';
+      ctx.fillRect(x, H - hh, bw + 1, Math.min(12, hh));
+    }
+
+    // water with shimmer on the right
+    const wy = H * 0.8;
+    const wg = ctx.createLinearGradient(0, wy, 0, H);
+    wg.addColorStop(0, '#2f6b8a'); wg.addColorStop(1, '#173d55');
+    ctx.fillStyle = wg; ctx.fillRect(W * 0.28, wy, W * 0.72, H - wy);
+    ctx.fillStyle = 'rgba(255,210,140,.5)';
+    for (let i = 0; i < 26; i++) {
+      const lx = W * (0.34 + h(i + 20) * 0.6);
+      const ly = wy + 4 + h(i + 30) * (H - wy - 8);
+      const lw = 14 + h(i + 7) * 60;
+      ctx.globalAlpha = 0.25 + 0.3 * Math.abs(Math.sin(t * 1.7 + i));
+      ctx.fillRect(lx, ly, lw, 2);
+    }
+    ctx.globalAlpha = 1;
+
+    // caption
+    ctx.fillStyle = 'rgba(255,250,235,.9)';
+    ctx.font = '600 14px ui-monospace, monospace';
+    ctx.textAlign = 'center';
+    ctx.fillText('C U B E L A N D \u2014 starting engine\u2026', W / 2, H - 34);
+
+    requestAnimationFrame(frame);
+  }
+  requestAnimationFrame(frame);
+})();
+</script>
+
+<!-- Engine bootstrap: boots the render loop and sets window.__CUBELAND_READY__ -->
+<script type="module" src="/src/main.ts"></script>
+</body>
+</html>
